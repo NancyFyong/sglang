@@ -15,6 +15,7 @@ import msgspec
 
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BackupDramReq,
     ChecksumInfo,
     CheckWeightsReqOutput,
@@ -261,6 +262,35 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
 
         output = GetInternalStateReqOutput(internal_state=sanitized)
         self.assertEqual(_round_trip(output), output)
+
+
+class TestWeightVersionSpansRoundTrip(CustomTestCase):
+    """The per-request weight-version spans ride the same msgpack IPC path."""
+
+    def test_abort_req_carries_spans(self):
+        """A scheduler-side abort keeps its spans across the wire."""
+        obj = AbortReq(
+            rid="r0",
+            weight_versions=[
+                {"version": "v1", "start": 0, "end": 3},
+                {"version": "v2", "start": 3, "end": 7},
+            ],
+        )
+
+        decoded = _double_hop(obj)
+
+        self.assertEqual(
+            decoded.weight_versions,
+            [
+                {"version": "v1", "start": 0, "end": 3},
+                {"version": "v2", "start": 3, "end": 7},
+            ],
+        )
+        self.assertIsInstance(decoded.weight_versions[0], dict)
+
+    def test_abort_req_without_spans_stays_none(self):
+        """Aborts that never reached generation carry nothing."""
+        self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
 
 
 if __name__ == "__main__":
