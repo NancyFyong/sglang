@@ -41,27 +41,19 @@ def compute_weight_version_spans(
     current_version: str,
     num_output_tokens: int,
 ) -> WeightVersionSpans:
-    ends = [
-        (event.old_version, min(event.num_output_tokens, num_output_tokens))
-        for event in events
-    ]
-    ends.append((current_version, num_output_tokens))
-    sampled_ends = [
-        (version, end)
-        for index, (version, end) in enumerate(ends)
-        if index == 0 or end > ends[index - 1][1]
-    ]
-    boundaries = [
-        (version, end)
-        for index, (version, end) in enumerate(sampled_ends)
-        if index == len(sampled_ends) - 1 or version != sampled_ends[index + 1][0]
-    ]
+    changes = [(event.old_version, event.num_output_tokens) for event in events]
+    changes.append((current_version, num_output_tokens))
 
     spans: WeightVersionSpans = []
-    prev_end = 0
-    for version, end in boundaries:
-        spans.append({"version": version, "start": prev_end, "end": end})
-        prev_end = end
+    for version, end in changes:
+        end = min(end, num_output_tokens)
+        if spans and end <= spans[-1]["end"]:
+            continue
+        if spans and version == spans[-1]["version"]:
+            spans[-1]["end"] = end
+            continue
+        start = spans[-1]["end"] if spans else 0
+        spans.append({"version": version, "start": start, "end": end})
     return spans
 
 
