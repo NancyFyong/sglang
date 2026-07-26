@@ -105,7 +105,7 @@ class TestWeightVersionSpans(CustomTestCase):
             futures = [
                 executor.submit(
                     self._generate,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=max_new_tokens - 16 * i,
                     prompt=f"Write a long story about the number {i}.",
                 )
                 for i in range(num_requests)
@@ -113,8 +113,10 @@ class TestWeightVersionSpans(CustomTestCase):
 
             time.sleep(2)
             self._pause(mode)
-            while_paused()
-            self._continue()
+            try:
+                while_paused()
+            finally:
+                self._continue()
 
             return [future.result() for future in futures]
 
@@ -167,6 +169,7 @@ class TestWeightVersionSpans(CustomTestCase):
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
             versions = [span["version"] for span in spans]
+            self.assertEqual(versions[0], base_version)
             self.assertIn(versions[-1], (base_version, "disk-v2"))
             if len(spans) > 1:
                 multi_span_count += 1
@@ -193,11 +196,15 @@ class TestWeightVersionSpans(CustomTestCase):
         )
         self.assertEqual(response.status_code, 200)
 
-        metadata = response.json()["metadata"]
+        data = response.json()
+        metadata = data["metadata"]
         self.assertIn("weight_versions", metadata)
         spans = metadata["weight_versions"]
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0]["version"], metadata["weight_version"])
+        self.assertEqual(metadata["weight_version"], self._current_version())
+        self.assertEqual(spans[0]["start"], 0)
+        self.assertEqual(spans[0]["end"], data["usage"]["completion_tokens"])
 
     def test_05_aborted_retracted_requests_report_spans(self):
         """Requests aborted while retracted in the waiting queue still report their spans."""
@@ -246,6 +253,7 @@ class TestWeightVersionSpans(CustomTestCase):
             self.assertNotEqual(meta_info["finish_reason"]["type"], "abort")
             spans = _assert_spans_contiguous(self, meta_info)
             self.assertEqual(spans[-1]["end"], meta_info["completion_tokens"])
+            self.assertEqual(spans[0]["version"], previous_version)
             if len(spans) > 1:
                 split_count += 1
                 self.assertEqual(
@@ -319,8 +327,10 @@ class TestWeightVersionSpans(CustomTestCase):
             for new_version in ("multi-a", "multi-b"):
                 time.sleep(2)
                 self._pause("in_place")
-                self._set_weight_version(new_version)
-                self._continue()
+                try:
+                    self._set_weight_version(new_version)
+                finally:
+                    self._continue()
 
             results = [future.result() for future in futures]
 
@@ -348,16 +358,18 @@ class TestWeightVersionSpans(CustomTestCase):
         version = self._current_version()
 
         self._pause("in_place")
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._generate, max_new_tokens=64)
-            time.sleep(1)
-            requests.post(
-                f"{self.base_url}/abort_request",
-                json={"abort_all": True},
-                timeout=30,
-            ).raise_for_status()
-            data = future.result()
-        self._continue()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self._generate, max_new_tokens=64)
+                time.sleep(1)
+                requests.post(
+                    f"{self.base_url}/abort_request",
+                    json={"abort_all": True},
+                    timeout=30,
+                ).raise_for_status()
+                data = future.result()
+        finally:
+            self._continue()
 
         meta_info = data["meta_info"]
         self.assertEqual(meta_info["finish_reason"]["type"], "abort")
@@ -395,9 +407,11 @@ class TestWeightVersionSpans(CustomTestCase):
                 break
             chunks.append(json.loads(payload))
 
+        version = self._current_version()
         self.assertGreater(len(chunks), 1)
         for chunk in chunks[:-1]:
             self.assertNotIn("weight_versions", chunk["meta_info"])
+            self.assertEqual(chunk["meta_info"]["weight_version"], version)
 
         meta_info = chunks[-1]["meta_info"]
         spans = _assert_spans_contiguous(self, meta_info)

@@ -38,6 +38,36 @@ class _ReqStub:
         )
 
 
+def _expected_spans(events, current_version, num_output_tokens):
+    """Reference model: name the version that sampled each token, then run-length encode."""
+    per_token = []
+    for index in range(num_output_tokens):
+        owner = next(
+            (event.old_version for event in events if event.num_output_tokens > index),
+            current_version,
+        )
+        per_token.append(owner)
+
+    if not per_token:
+        first_event_end_at_zero = next(
+            (event for event in events if event.num_output_tokens >= 0), None
+        )
+        version = (
+            first_event_end_at_zero.old_version
+            if first_event_end_at_zero is not None
+            else current_version
+        )
+        return [WeightVersionSpan(version=version, start=0, end=0)]
+
+    spans = []
+    for index, version in enumerate(per_token):
+        if spans and spans[-1].version == version:
+            spans[-1].end = index + 1
+        else:
+            spans.append(WeightVersionSpan(version=version, start=index, end=index + 1))
+    return spans
+
+
 class TestComputeWeightVersionSpans(CustomTestCase):
     def test_no_events_returns_single_span(self):
         """A request untouched by updates gets one span covering all output tokens."""
@@ -177,12 +207,28 @@ class TestComputeWeightVersionSpans(CustomTestCase):
             ],
         )
 
+    def test_version_returning_after_tokens_keeps_separate_spans(self):
+        """A version that comes back after another one sampled tokens gets its own span."""
+        req = _ReqStub(2)
+        req.record_weight_version_change(old_version="v1")
+        req.output_ids.extend([0] * 2)
+        req.record_weight_version_change(old_version="v2")
+        req.output_ids.extend([0] * 2)
+        self.assertEqual(
+            req.compute_weight_version_spans(current_version="v1", num_output_tokens=6),
+            [
+                WeightVersionSpan(version="v1", start=0, end=2),
+                WeightVersionSpan(version="v2", start=2, end=4),
+                WeightVersionSpan(version="v1", start=4, end=6),
+            ],
+        )
+
     def test_spans_satisfy_the_contract_for_random_event_sequences(self):
         """Randomized event sequences always yield ordered, contiguous, non-duplicated spans."""
         rng = random.Random(0)
         versions = ["v0", "v1", "v2"]
         for _ in range(300):
-            counts = sorted(rng.randint(0, 8) for _ in range(rng.randint(0, 5)))
+            counts = sorted(rng.randint(1, 8) for _ in range(rng.randint(0, 5)))
             events = [
                 WeightVersionEvent(
                     old_version=rng.choice(versions), num_output_tokens=count
@@ -197,27 +243,21 @@ class TestComputeWeightVersionSpans(CustomTestCase):
                 num_output_tokens=num_output_tokens,
             )
 
-            self.assertGreater(len(spans), 0)
-            self.assertEqual(spans[0]["start"], 0)
-            self.assertEqual(spans[-1]["end"], num_output_tokens)
-            for index, span in enumerate(spans):
-                self.assertLessEqual(span["start"], span["end"])
-                if index > 0:
-                    self.assertLess(span["start"], span["end"])
+            self.assertEqual(
+                spans,
+                _expected_spans(events, current_version, num_output_tokens),
+            )
+            self.assertEqual(spans[0].start, 0)
+            self.assertEqual(spans[-1].end, num_output_tokens)
             for previous, current in zip(spans, spans[1:]):
-                self.assertEqual(previous["end"], current["start"])
-                self.assertNotEqual(previous["version"], current["version"])
-
-    def test_version_revert_merges_adjacent_spans(self):
-        """A v1 -> v2 -> v1 revert with no tokens under v2 collapses into one v1 span."""
-        req = _ReqStub(2)
-        req.record_weight_version_change(old_version="v1")
-        req.record_weight_version_change(old_version="v2")
-        req.output_ids.extend([0] * 3)
-        self.assertEqual(
-            req.compute_weight_version_spans(current_version="v1", num_output_tokens=5),
-            [WeightVersionSpan(version="v1", start=0, end=5)],
-        )
+                self.assertEqual(previous.end, current.start)
+                self.assertNotEqual(previous.version, current.version)
+            if num_output_tokens == 0:
+                self.assertEqual(len(spans), 1)
+                self.assertEqual(spans[0].end, 0)
+            else:
+                for span in spans:
+                    self.assertLess(span.start, span.end)
 
 
 class _ServerArgsStub:
@@ -288,17 +328,18 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         """With pipeline parallelism every microbatch is visited, not just the selected one."""
         mb0_req = _ReqStub(2)
         mb1_req = _ReqStub(4)
+        pending_req = _ReqStub(6)
         scheduler = self._scheduler("v1", [], [], pp_size=2)
         scheduler.running_mbs = [
             SimpleNamespace(reqs=[mb0_req]),
             SimpleNamespace(reqs=[mb1_req]),
         ]
-        scheduler.mbs = [None]
+        scheduler.mbs = [None, SimpleNamespace(reqs=[pending_req])]
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
-        self.assertEqual(len(mb0_req.weight_version_events), 1)
-        self.assertEqual(len(mb1_req.weight_version_events), 1)
+        for req in (mb0_req, mb1_req, pending_req):
+            self.assertEqual(len(req.weight_version_events), 1)
 
     def test_same_version_is_a_noop(self):
         """Re-announcing the current version must not record events."""
@@ -327,8 +368,11 @@ class TestRecordWeightVersionEvents(CustomTestCase):
         empty_req = _ReqStub(0)
         started_req = _ReqStub(4)
 
-        record_weight_version_events([empty_req, started_req], old_version="v1")
+        num_recorded = record_weight_version_events(
+            [empty_req, started_req, _ReqStub(2)], old_version="v1"
+        )
 
+        self.assertEqual(num_recorded, 2)
         self.assertEqual(empty_req.weight_version_events, [])
         self.assertEqual(len(started_req.weight_version_events), 1)
         self.assertEqual(started_req.weight_version_events[0].old_version, "v1")
@@ -361,26 +405,72 @@ class TestMakeAbortReq(CustomTestCase):
 
 
 class TestRecordWeightVersionAfterUpdate(CustomTestCase):
-    def test_with_a_scheduler_it_forwards_the_version(self):
-        """The version reported by a successful update reaches the scheduler."""
-        recorded = []
-        updater = SimpleNamespace(
+    def _updater(self, target_result, draft_result=None):
+        self.recorded = []
+        return SchedulerWeightUpdaterManager(
+            tp_worker=SimpleNamespace(
+                update_weights_from_disk=lambda recv_req: target_result
+            ),
+            draft_worker=(
+                None
+                if draft_result is None
+                else SimpleNamespace(
+                    update_weights_from_disk=lambda recv_req: draft_result
+                )
+            ),
+            tp_cpu_group=None,
+            memory_saver_adapter=None,
+            flush_cache=lambda **kwargs: True,
+            is_fully_idle=lambda **kwargs: True,
             scheduler=SimpleNamespace(
-                record_weight_version_change=lambda new_version: recorded.append(
+                record_weight_version_change=lambda new_version: self.recorded.append(
                     new_version
                 )
-            )
+            ),
         )
 
-        SchedulerWeightUpdaterManager.record_weight_version_after_update(updater, "v2")
+    def _request(self):
+        return SimpleNamespace(
+            weight_version="v2", flush_cache=True, torch_empty_cache=False
+        )
 
-        self.assertEqual(recorded, ["v2"])
+    def test_successful_update_records_the_version(self):
+        """A refit that reports success advances the scheduler-side version."""
+        updater = self._updater(target_result=(True, "ok"))
+
+        output = updater.update_weights_from_disk(self._request())
+
+        self.assertTrue(output.success)
+        self.assertEqual(self.recorded, ["v2"])
+
+    def test_failed_update_does_not_record_the_version(self):
+        """A refit that fails must leave the version alone, or later tokens are mislabelled."""
+        updater = self._updater(target_result=(False, "boom"))
+
+        output = updater.update_weights_from_disk(self._request())
+
+        self.assertFalse(output.success)
+        self.assertEqual(self.recorded, [])
+
+    def test_draft_failure_does_not_record_the_version(self):
+        """The target succeeding is not enough: a failed draft refit leaves the engine mixed."""
+        updater = self._updater(
+            target_result=(True, "ok"), draft_result=(False, "draft boom")
+        )
+
+        output = updater.update_weights_from_disk(self._request())
+
+        self.assertFalse(output.success)
+        self.assertEqual(self.recorded, [])
 
 
 class TestBuildEndpointWeightVersionMetadata(CustomTestCase):
     def test_metadata_projects_only_the_weight_fields(self):
         """Endpoint metadata exposes the version fields and nothing else from meta_info."""
-        spans = [WeightVersionSpan(version="v2", start=0, end=7)]
+        spans = [
+            {"version": "v1", "start": 0, "end": 3},
+            {"version": "v2", "start": 3, "end": 7},
+        ]
         metadata = build_endpoint_weight_version_metadata(
             {
                 "weight_version": "v2",

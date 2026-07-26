@@ -287,10 +287,10 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
                 WeightVersionSpan(version="v2", start=3, end=7),
             ],
         )
-        self.assertIsInstance(decoded.weight_versions[0], dict)
+        self.assertIsInstance(decoded.weight_versions[0], WeightVersionSpan)
 
-    def test_abort_req_without_spans_stays_none(self):
-        """Aborts that never reached generation carry nothing."""
+    def test_abort_req_defaults_to_no_spans(self):
+        """The field is optional on the wire, so an abort without spans decodes to None."""
         self.assertIsNone(_round_trip(AbortReq(rid="r0")).weight_versions)
 
 
