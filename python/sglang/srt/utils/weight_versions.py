@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List
+
+import msgspec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+
 # ======================================================================
 # Shared types
 # ======================================================================
-WeightVersionSpan = Dict[str, Union[str, int]]
+class WeightVersionSpan(msgspec.Struct, kw_only=True, array_like=True):
+    version: str
+    start: int
+    end: int
+
+
 WeightVersionSpans = List[WeightVersionSpan]
 
 
@@ -47,13 +55,13 @@ def compute_weight_version_spans(
     spans: WeightVersionSpans = []
     for version, end in changes:
         end = min(end, num_output_tokens)
-        if spans and end <= spans[-1]["end"]:
+        if spans and end <= spans[-1].end:
             continue
-        if spans and version == spans[-1]["version"]:
-            spans[-1]["end"] = end
+        if spans and version == spans[-1].version:
+            spans[-1].end = end
             continue
-        start = spans[-1]["end"] if spans else 0
-        spans.append({"version": version, "start": start, "end": end})
+        start = spans[-1].end if spans else 0
+        spans.append(WeightVersionSpan(version=version, start=start, end=end))
     return spans
 
 
@@ -65,14 +73,19 @@ def add_weight_versions_to_meta_info(
     spans: WeightVersionSpans,
     num_output_tokens: int,
 ) -> None:
-    spans = [
-        {**span, "end": min(span["end"], num_output_tokens)}
-        for span in spans
-        if span["start"] < num_output_tokens or span["start"] == 0
+    visible = [
+        span for span in spans if span.start < num_output_tokens or span.start == 0
     ]
 
-    meta_info["weight_versions"] = spans
-    meta_info["weight_version"] = spans[-1]["version"]
+    meta_info["weight_versions"] = [
+        {
+            "version": span.version,
+            "start": span.start,
+            "end": min(span.end, num_output_tokens),
+        }
+        for span in visible
+    ]
+    meta_info["weight_version"] = visible[-1].version
 
 
 # ======================================================================

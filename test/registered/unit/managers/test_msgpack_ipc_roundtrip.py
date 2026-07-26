@@ -38,6 +38,7 @@ from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.weight_checker import ChecksumInfo as PydanticChecksumInfo
 from sglang.srt.utils.weight_checker import ParallelismInfo as PydanticParallelismInfo
+from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -272,8 +273,8 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
         obj = AbortReq(
             rid="r0",
             weight_versions=[
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
         )
 
@@ -282,8 +283,8 @@ class TestWeightVersionSpansRoundTrip(CustomTestCase):
         self.assertEqual(
             decoded.weight_versions,
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
         )
         self.assertIsInstance(decoded.weight_versions[0], dict)

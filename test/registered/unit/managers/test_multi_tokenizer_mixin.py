@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils.weight_versions import WeightVersionSpan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
@@ -78,10 +79,10 @@ def _make_batch_str_output() -> BatchStrOutput:
         retraction_counts=[0, 0],
         weight_versions=[
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 5},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=5),
             ],
-            [{"version": "v2", "start": 0, "end": 2}],
+            [WeightVersionSpan(version="v2", start=0, end=2)],
         ],
     )
 
@@ -107,14 +108,14 @@ class TestMultiTokenizerMixin(unittest.TestCase):
             _handle_output_by_index(output, 0).weight_versions,
             [
                 [
-                    {"version": "v1", "start": 0, "end": 3},
-                    {"version": "v2", "start": 3, "end": 5},
+                    WeightVersionSpan(version="v1", start=0, end=3),
+                    WeightVersionSpan(version="v2", start=3, end=5),
                 ]
             ],
         )
         self.assertEqual(
             _handle_output_by_index(output, 1).weight_versions,
-            [[{"version": "v2", "start": 0, "end": 2}]],
+            [[WeightVersionSpan(version="v2", start=0, end=2)]],
         )
 
     def test_batch_str_output_without_weight_versions_stays_none(self):

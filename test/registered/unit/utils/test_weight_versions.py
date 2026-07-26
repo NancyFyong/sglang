@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 )
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
+    WeightVersionSpan,
     add_weight_versions_to_meta_info,
     build_endpoint_weight_version_metadata,
     compute_weight_version_spans,
@@ -44,7 +45,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
             _ReqStub(5).compute_weight_version_spans(
                 current_version="v1", num_output_tokens=5
             ),
-            [{"version": "v1", "start": 0, "end": 5}],
+            [WeightVersionSpan(version="v1", start=0, end=5)],
         )
 
     def test_zero_output_tokens_returns_empty_span_span(self):
@@ -53,7 +54,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
             _ReqStub(0).compute_weight_version_spans(
                 current_version="v1", num_output_tokens=0
             ),
-            [{"version": "v1", "start": 0, "end": 0}],
+            [WeightVersionSpan(version="v1", start=0, end=0)],
         )
 
     def test_one_update_splits_into_two_spans(self):
@@ -64,8 +65,8 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v2", num_output_tokens=7),
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
         )
 
@@ -79,9 +80,9 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v3", num_output_tokens=6),
             [
-                {"version": "v1", "start": 0, "end": 2},
-                {"version": "v2", "start": 2, "end": 5},
-                {"version": "v3", "start": 5, "end": 6},
+                WeightVersionSpan(version="v1", start=0, end=2),
+                WeightVersionSpan(version="v2", start=2, end=5),
+                WeightVersionSpan(version="v3", start=5, end=6),
             ],
         )
 
@@ -93,7 +94,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         req.output_ids.extend([0] * 4)
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v2", num_output_tokens=4),
-            [{"version": "v2", "start": 0, "end": 4}],
+            [WeightVersionSpan(version="v2", start=0, end=4)],
         )
 
     def test_back_to_back_updates_skip_empty_span(self):
@@ -105,8 +106,8 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v3", num_output_tokens=4),
             [
-                {"version": "v1", "start": 0, "end": 2},
-                {"version": "v3", "start": 2, "end": 4},
+                WeightVersionSpan(version="v1", start=0, end=2),
+                WeightVersionSpan(version="v3", start=2, end=4),
             ],
         )
 
@@ -116,7 +117,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         req.record_weight_version_change(old_version="v1")
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v2", num_output_tokens=4),
-            [{"version": "v1", "start": 0, "end": 4}],
+            [WeightVersionSpan(version="v1", start=0, end=4)],
         )
 
     def test_event_beyond_reported_length_is_clamped(self):
@@ -125,7 +126,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         req.record_weight_version_change(old_version="v1")
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v2", num_output_tokens=4),
-            [{"version": "v1", "start": 0, "end": 4}],
+            [WeightVersionSpan(version="v1", start=0, end=4)],
         )
 
     def test_clamp_to_zero_reports_the_pre_update_version(self):
@@ -134,7 +135,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         req.record_weight_version_change(old_version="v1")
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v2", num_output_tokens=0),
-            [{"version": "v1", "start": 0, "end": 0}],
+            [WeightVersionSpan(version="v1", start=0, end=0)],
         )
 
     def test_clamped_output_can_end_before_the_current_version(self):
@@ -146,8 +147,8 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v3", num_output_tokens=4),
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 4},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=4),
             ],
         )
 
@@ -159,7 +160,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         req.record_weight_version_change(old_version="v2")
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v1", num_output_tokens=2),
-            [{"version": "v1", "start": 0, "end": 2}],
+            [WeightVersionSpan(version="v1", start=0, end=2)],
         )
 
     def test_duplicate_event_at_the_same_length_is_idempotent(self):
@@ -171,8 +172,8 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v2", num_output_tokens=5),
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 5},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=5),
             ],
         )
 
@@ -215,7 +216,7 @@ class TestComputeWeightVersionSpans(CustomTestCase):
         req.output_ids.extend([0] * 3)
         self.assertEqual(
             req.compute_weight_version_spans(current_version="v1", num_output_tokens=5),
-            [{"version": "v1", "start": 0, "end": 5}],
+            [WeightVersionSpan(version="v1", start=0, end=5)],
         )
 
 
@@ -353,8 +354,8 @@ class TestMakeAbortReq(CustomTestCase):
         self.assertEqual(
             abort_req.weight_versions,
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 4},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=4),
             ],
         )
 
@@ -379,7 +380,7 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
 class TestBuildEndpointWeightVersionMetadata(CustomTestCase):
     def test_metadata_projects_only_the_weight_fields(self):
         """Endpoint metadata exposes the version fields and nothing else from meta_info."""
-        spans = [{"version": "v2", "start": 0, "end": 7}]
+        spans = [WeightVersionSpan(version="v2", start=0, end=7)]
         metadata = build_endpoint_weight_version_metadata(
             {
                 "weight_version": "v2",
@@ -403,8 +404,8 @@ class TestAddWeightVersionsToMetaInfo(CustomTestCase):
         add_weight_versions_to_meta_info(
             meta_info,
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
             num_output_tokens=7,
         )
@@ -423,8 +424,8 @@ class TestAddWeightVersionsToMetaInfo(CustomTestCase):
         add_weight_versions_to_meta_info(
             meta_info,
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
             num_output_tokens=5,
         )
@@ -441,7 +442,9 @@ class TestAddWeightVersionsToMetaInfo(CustomTestCase):
         """A response longer than the sampled range leaves the spans untouched."""
         meta_info = {}
         add_weight_versions_to_meta_info(
-            meta_info, [{"version": "v1", "start": 0, "end": 3}], num_output_tokens=10
+            meta_info,
+            [WeightVersionSpan(version="v1", start=0, end=3)],
+            num_output_tokens=10,
         )
         self.assertEqual(
             meta_info["weight_versions"], [{"version": "v1", "start": 0, "end": 3}]
@@ -454,8 +457,8 @@ class TestAddWeightVersionsToMetaInfo(CustomTestCase):
         add_weight_versions_to_meta_info(
             meta_info,
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
             num_output_tokens=3,
         )
@@ -470,8 +473,8 @@ class TestAddWeightVersionsToMetaInfo(CustomTestCase):
         add_weight_versions_to_meta_info(
             meta_info,
             [
-                {"version": "v1", "start": 0, "end": 3},
-                {"version": "v2", "start": 3, "end": 7},
+                WeightVersionSpan(version="v1", start=0, end=3),
+                WeightVersionSpan(version="v2", start=3, end=7),
             ],
             num_output_tokens=0,
         )
