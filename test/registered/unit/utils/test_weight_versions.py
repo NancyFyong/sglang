@@ -270,7 +270,6 @@ class _ServerArgsStub:
 
 class _SchedulerStub:
     collect_inflight_reqs = Scheduler.collect_inflight_reqs
-    make_abort_req = Scheduler.make_abort_req
 
     def __init__(
         self, version, running, waiting, chunked=None, last_batch=None, pp_size=1
