@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List
 
 import msgspec
 
+from sglang.srt.utils.msgspec_utils import msgspec_struct_pydantic_core_schema
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -16,6 +18,10 @@ class WeightVersionSpan(msgspec.Struct, kw_only=True, array_like=True):
     version: str
     start: int
     end: int
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source, handler):
+        return msgspec_struct_pydantic_core_schema(cls, handler)
 
 
 WeightVersionSpans = List[WeightVersionSpan]
