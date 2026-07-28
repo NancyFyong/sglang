@@ -419,6 +419,15 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        # LingBot-Video ships its transformer and scheduler as remote-code modules
+        # ("lingbot_video.*" / "lingbot_video_diffusers.*") in model_index.json.
+        # SGLang has native implementations of both classes, resolved by class name,
+        # so route them through the regular diffusers loaders.
+        if transformers_or_diffusers.startswith(
+            ("lingbot_video.", "lingbot_video_diffusers.")
+        ):
+            transformers_or_diffusers = "diffusers"
+
         return transformers_or_diffusers
 
     @classmethod
