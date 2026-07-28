@@ -6,20 +6,30 @@ import tempfile
 from types import SimpleNamespace
 
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEArchConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
+    LingBotVideoMoETI2VConfig,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
+    LingBotVideoMoETI2VSamplingParams,
 )
-from sglang.multimodal_gen.registry import _get_config_info, get_model_info
+from sglang.multimodal_gen.registry import (
+    _get_config_info,
+    get_model_info,
+    get_pipeline_config_classes,
+)
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoGroupedExperts,
     LingBotVideoRouter,
+)
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.models.dits import (
     lingbot_video_moe as dits_lingbot_video_moe,
@@ -31,8 +41,15 @@ from sglang.multimodal_gen.runtime.models.dits.lingbot_video_moe import (
     make_joint_position_ids,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
+    IMG_PROMPT_TEMPLATE,
     PROMPT_TEMPLATE,
     LingBotVideoTextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.ti2v import (
+    apply_condition_latent,
+    encode_condition_latent,
+    preprocess_condition_pixels,
+    should_apply_lingbot_ti2v,
 )
 
 _LINGBOT_MODULE_SUBDIRS = (
@@ -365,3 +382,272 @@ def test_joint_position_ids_match_reference_and_cover_padding():
         torch.testing.assert_close(
             vec_b[start : start + real], make_joint_position_ids(t, gt, gh, gw, dev)
         )
+
+
+# --- TI2V (first-frame conditioned) ---
+
+
+def test_ti2v_class_name_wins_over_t2v_path_detector():
+    """A TI2V checkpoint dir also matches the T2V path detector.
+
+    Registration order decides, so this guards against re-ordering the two
+    ``register_configs`` calls in registry.py.
+    """
+    get_model_info.cache_clear()
+    _get_config_info.cache_clear()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_dir = os.path.join(tmpdir, "lingbot-video-moe-30b-a3b")
+        os.makedirs(model_dir)
+        with open(
+            os.path.join(model_dir, "model_index.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(
+                {
+                    "_class_name": "LingBotVideoImageToVideoPipeline",
+                    "_diffusers_version": "0.37.1",
+                },
+                f,
+            )
+        for subdir in _LINGBOT_MODULE_SUBDIRS:
+            os.mkdir(os.path.join(model_dir, subdir))
+        info = get_model_info(model_dir, backend="sglang")
+    get_model_info.cache_clear()
+    _get_config_info.cache_clear()
+
+    assert info.pipeline_cls.__name__ == "LingBotVideoImageToVideoPipeline"
+    assert info.pipeline_config_cls is LingBotVideoMoETI2VConfig
+    assert info.sampling_param_cls is LingBotVideoMoETI2VSamplingParams
+
+
+def test_ti2v_config_loads_vae_encoder_and_keeps_raw_condition_image():
+    config = LingBotVideoMoETI2VConfig()
+    # The condition frame is VAE-encoded inside the denoising loop, and it is
+    # resized to the *requested* resolution by the LingBot helpers rather than
+    # by InputValidationStage.
+    assert config.vae_config.load_encoder
+    assert config.vae_config.load_decoder
+    assert config.skip_input_image_preprocess
+
+
+def test_should_apply_lingbot_ti2v_needs_ti2v_config_and_image():
+    image = Image.new("RGB", (8, 8))
+    ti2v_args = SimpleNamespace(pipeline_config=LingBotVideoMoETI2VConfig())
+    t2v_args = SimpleNamespace(pipeline_config=LingBotVideoMoEPipelineConfig())
+
+    assert should_apply_lingbot_ti2v(SimpleNamespace(condition_image=image), ti2v_args)
+    assert not should_apply_lingbot_ti2v(
+        SimpleNamespace(condition_image=None), ti2v_args
+    )
+    assert not should_apply_lingbot_ti2v(
+        SimpleNamespace(condition_image=image), t2v_args
+    )
+
+
+def test_condition_pixels_honor_requested_resolution():
+    """LingBot crops to the requested size instead of deriving one from the image.
+
+    Turns red if this ever falls back to ``best_output_size``, which recomputes
+    the output size from the condition image's aspect ratio.
+    """
+    pixels = preprocess_condition_pixels(
+        Image.new("RGB", (1280, 704), color=(255, 128, 0)), height=480, width=832
+    )
+
+    assert tuple(pixels.shape) == (1, 3, 1, 480, 832)
+    assert pixels.dtype == torch.float32
+    # Scale-to-cover never pads, so a constant image stays constant in [0, 1].
+    torch.testing.assert_close(
+        pixels[0, :, 0, 0, 0], torch.tensor([1.0, 128.0 / 255.0, 0.0])
+    )
+    assert float(pixels.min()) >= 0.0 and float(pixels.max()) <= 1.0
+
+
+def test_condition_pixels_center_crop_keeps_the_middle():
+    # Left third black, middle third white, right third black. A center crop to a
+    # square keeps the white band centered; an off-by-one crop would skew it.
+    array = torch.zeros(3, 96, 288, dtype=torch.uint8)
+    array[:, :, 96:192] = 255
+    image = Image.fromarray(array.permute(1, 2, 0).numpy())
+
+    pixels = preprocess_condition_pixels(image, height=96, width=96)
+
+    assert tuple(pixels.shape) == (1, 3, 1, 96, 96)
+    torch.testing.assert_close(pixels, torch.ones_like(pixels))
+
+
+def test_encode_condition_latent_applies_vae_normalization(monkeypatch):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
+        ti2v,
+    )
+
+    monkeypatch.setattr(ti2v, "get_local_torch_device", lambda: torch.device("cpu"))
+
+    raw_latent = torch.arange(16, dtype=torch.float32).view(1, 16, 1, 1, 1)
+    captured = {}
+
+    class _Dist:
+        def sample(self, generator=None):
+            captured["generator"] = generator
+            return raw_latent
+
+    class _VAE:
+        def encode(self, x):
+            captured["pixels"] = x
+            return _Dist()
+
+    config = LingBotVideoMoETI2VConfig()
+    scale, shift = config.get_decode_scale_and_shift(
+        torch.device("cpu"), torch.float32, vae=None
+    )
+    generator = torch.Generator().manual_seed(0)
+
+    latent = encode_condition_latent(
+        vae=_VAE(),
+        pixels=torch.full((1, 3, 1, 2, 2), 0.75),
+        vae_dtype=torch.float32,
+        generator=generator,
+        scale=scale,
+        shift=shift,
+    )
+
+    # The VAE sees [-1, 1] pixels, and the latent is (z - mean) / std, i.e. the
+    # exact inverse of the decode-side denormalization.
+    torch.testing.assert_close(
+        captured["pixels"], torch.full((1, 3, 1, 2, 2), 0.5), rtol=0, atol=0
+    )
+    assert captured["generator"] is generator
+    torch.testing.assert_close(latent, (raw_latent - shift) * scale)
+    torch.testing.assert_close(latent / scale + shift, raw_latent)
+
+
+def test_apply_condition_latent_rebinds_instead_of_writing_in_place():
+    latents = torch.randn(1, 16, 21, 4, 4)
+    original = latents.clone()
+    condition = torch.randn(1, 16, 1, 4, 4)
+
+    out = apply_condition_latent(latents, condition)
+
+    assert out is not latents
+    torch.testing.assert_close(latents, original)  # rebind-only, no slice write
+    torch.testing.assert_close(out[:, :, :1], condition)
+    torch.testing.assert_close(out[:, :, 1:], original[:, :, 1:])
+
+
+class _RecordingQwenProcessor(_FakeQwenProcessor):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        return super().__call__(**kwargs)
+
+
+def _encode_with_images(images):
+    prompt_width, prefix_width, true_len, channels = 10, 3, 8, 4
+    hidden = torch.zeros(1, prompt_width, channels)
+    processor = _RecordingQwenProcessor(prompt_width, prefix_width, true_len)
+    stage = _text_encoding_stage(
+        processor, lambda **kwargs: SimpleNamespace(hidden_states=[hidden])
+    )
+    stage._encode_prompt(
+        "a structured caption", torch.device("cpu"), torch.float32, images=images
+    )
+    return next(call for call in processor.calls if "max_length" in call)
+
+
+def test_text_encoding_passes_condition_image_with_marker():
+    call = _encode_with_images([Image.new("RGB", (32, 32))])
+    assert call["images"] is not None and len(call["images"]) == 1
+    # The visual marker sits in front of the user text, inside the template.
+    assert IMG_PROMPT_TEMPLATE in call["text"][0]
+    assert call["text"][0].index(IMG_PROMPT_TEMPLATE) < call["text"][0].index(
+        "a structured caption"
+    )
+
+
+def test_text_encoding_stays_text_only_without_condition_image():
+    call = _encode_with_images(None)
+    assert call["images"] is None
+    assert IMG_PROMPT_TEMPLATE not in call["text"][0]
+
+
+def test_explicit_pipeline_class_name_refines_t2v_config_to_ti2v():
+    """``--pipeline-class-name`` is how a TI2V run selects the TI2V config.
+
+    Both variants ship in the same HF repo, so the path detector resolves the
+    T2V config; ``PipelineConfig.from_pretrained`` only overrides it when the
+    pipeline's own config *strictly subclasses* the model default. Breaking
+    either the registration or the subclass relation would silently downgrade
+    a TI2V run to plain T2V.
+    """
+    config_classes = get_pipeline_config_classes("LingBotVideoImageToVideoPipeline")
+
+    assert config_classes == (
+        LingBotVideoMoETI2VConfig,
+        LingBotVideoMoETI2VSamplingParams,
+    )
+    assert issubclass(LingBotVideoMoETI2VConfig, LingBotVideoMoEPipelineConfig)
+    assert LingBotVideoMoETI2VConfig is not LingBotVideoMoEPipelineConfig
+
+
+def test_lingbot_remote_code_modules_load_through_diffusers_loaders():
+    """The HF repo declares transformer/scheduler as remote-code modules.
+
+    ``model_index.json`` names ``lingbot_video.transformer_lingbot_video`` /
+    ``lingbot_video.scheduling_flow_unipc`` instead of ``diffusers``, which
+    trips the library assertion in ``for_component_type``. SGLang implements
+    both classes natively, so the loader remaps them; dropping the remap makes
+    every LingBot-Video MoE run fail at weight loading.
+    """
+    assert (
+        ComponentLoader.resolve_transformers_or_diffusers(
+            "lingbot_video.transformer_lingbot_video", "transformer"
+        )
+        == "diffusers"
+    )
+    assert (
+        ComponentLoader.resolve_transformers_or_diffusers(
+            "lingbot_video_diffusers.scheduling_flow_unipc", "scheduler"
+        )
+        == "diffusers"
+    )
+    # Unrelated components keep their declared library.
+    assert (
+        ComponentLoader.resolve_transformers_or_diffusers(
+            "transformers", "text_encoder"
+        )
+        == "transformers"
+    )
+
+
+def test_vlm_image_patch_size_comes_from_the_processor():
+    """The VLM image must be sized without touching the text encoder object.
+
+    The Qwen3-VL encoder is either SGLang's native module (``config.arch_config``)
+    or the transformers one (``config.vision_config``) depending on whether the
+    customized loader succeeded, so reading the patch size off the encoder
+    crashes on one of the two paths. The processor exposes it identically for
+    both, and is also what patchifies the pixels we pass with ``do_resize=False``.
+    """
+    processor = _FakeQwenProcessor(10, 3, 8)
+    processor.image_processor = SimpleNamespace(patch_size=16)
+    stage = _text_encoding_stage(processor, encoder=None)
+
+    batch = SimpleNamespace(
+        condition_image=Image.new("RGB", (1280, 704)), height=480, width=832
+    )
+    server_args = SimpleNamespace(pipeline_config=LingBotVideoMoETI2VConfig())
+
+    images = stage._build_vlm_images(batch, server_args)
+
+    assert images is not None and len(images) == 1
+    # smart_resize aligns to patch_size * spatial_merge_size.
+    assert images[0].width % 32 == 0 and images[0].height % 32 == 0
+    # T2V keeps the text-only path.
+    assert (
+        stage._build_vlm_images(
+            batch, SimpleNamespace(pipeline_config=LingBotVideoMoEPipelineConfig())
+        )
+        is None
+    )

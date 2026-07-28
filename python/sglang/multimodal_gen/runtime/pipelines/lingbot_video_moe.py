@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
+    LingBotVideoMoETI2VConfig,
+)
+from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
+    LingBotVideoMoETI2VSamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -35,6 +41,10 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     )
 
+    def _denoising_vae(self):
+        """T2V never touches the VAE encoder, so keep it out of DenoisingStage."""
+        return None
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         self.add_stage(
@@ -52,9 +62,28 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
             DenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
+                vae=self._denoising_vae(),
             ),
         )
         self.add_standard_decoding_stage()
 
 
-EntryClass = [LingBotVideoPipeline]
+class LingBotVideoImageToVideoPipeline(LingBotVideoPipeline):
+    """TI2V variant: same stages, plus first-frame conditioning in DenoisingStage.
+
+    No ``ImageVAEEncodingStage`` is mounted on purpose: LingBot replaces the
+    first latent frame with a clean condition latent instead of concatenating an
+    image latent along the channel dim, and DenoisingStage rejects
+    ``batch.image_latent`` for TI2V. The condition frame is encoded inside the
+    denoising loop instead, which is why the VAE is handed to that stage.
+    """
+
+    pipeline_name = "LingBotVideoImageToVideoPipeline"
+    pipeline_config_cls = LingBotVideoMoETI2VConfig
+    sampling_params_cls = LingBotVideoMoETI2VSamplingParams
+
+    def _denoising_vae(self):
+        return self.get_module("vae")
+
+
+EntryClass = [LingBotVideoPipeline, LingBotVideoImageToVideoPipeline]

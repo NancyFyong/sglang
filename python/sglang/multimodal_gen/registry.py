@@ -71,6 +71,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
+    LingBotVideoMoETI2VConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
@@ -137,6 +138,7 @@ from sglang.multimodal_gen.configs.sample.krea2 import (
 )
 from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
     LingBotVideoMoESamplingParams,
+    LingBotVideoMoETI2VSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
@@ -1147,6 +1149,18 @@ def _register_configs():
             lambda hf_id: "ideogram-4-nf4" in hf_id.lower(),
             lambda hf_id: "comfy-org/ideogram-4" in hf_id.lower(),
             lambda hf_id: "comfy-org--ideogram-4" in hf_id.lower(),
+        ],
+    )
+
+    # TI2V must be registered before the T2V family: both detectors match a
+    # "lingbot-video-moe...ti2v" path and the first match wins.
+    register_configs(
+        sampling_param_cls=LingBotVideoMoETI2VSamplingParams,
+        pipeline_config_cls=LingBotVideoMoETI2VConfig,
+        model_detectors=[
+            lambda hf_id: "lingbotvideoimagetovideo" in hf_id.lower(),
+            lambda hf_id: "lingbot-video-moe" in hf_id.lower()
+            and "ti2v" in hf_id.lower(),
         ],
     )
 

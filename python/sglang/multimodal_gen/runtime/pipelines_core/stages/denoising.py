@@ -84,6 +84,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.ti2v import (
+    apply_condition_latent,
+    prepare_lingbot_ti2v_latents,
+    should_apply_lingbot_ti2v,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v import (
     blend_wan_ti2v_latents,
     expand_wan_ti2v_timestep,
@@ -836,9 +841,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             # Removed Tensor truthiness assert to avoid GPU sync
 
         should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
+        should_preprocess_for_lingbot_ti2v = should_apply_lingbot_ti2v(
+            batch, server_args
+        )
 
         # TI2V specific preparations - before SP sharding
-        if should_preprocess_for_wan_ti2v:
+        if should_preprocess_for_wan_ti2v or should_preprocess_for_lingbot_ti2v:
             vae_dtype = resolve_precision(
                 server_args, "vae", precision_attr="vae_precision"
             )
@@ -849,14 +857,26 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             ) as vae:
                 assert vae is not None
                 self.vae = vae
-                seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
-                    self.vae,
-                    latents,
-                    target_dtype,
-                    vae_dtype,
-                    batch,
-                    server_args,
-                )
+                if should_preprocess_for_wan_ti2v:
+                    seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
+                        self.vae,
+                        latents,
+                        target_dtype,
+                        vae_dtype,
+                        batch,
+                        server_args,
+                    )
+                else:
+                    # LingBot pins a clean condition latent to the first latent
+                    # frame; there is no mask and the timestep stays scalar.
+                    seq_len, reserved_frames_masks = None, None
+                    z = prepare_lingbot_ti2v_latents(
+                        vae=self.vae,
+                        latents=latents,
+                        vae_dtype=vae_dtype,
+                        batch=batch,
+                        server_args=server_args,
+                    )
         else:
             seq_len, z, reserved_frames_masks = (
                 None,
@@ -1502,10 +1522,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def post_forward_for_ti2v_task(
         self, batch: Req, server_args: ServerArgs, reserved_frames_mask, latents, z
     ):
-        """Re-apply Wan TI2V first-frame conditioning after each denoising step."""
-        should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
-        if should_preprocess_for_wan_ti2v:
+        """Re-apply TI2V first-frame conditioning after each denoising step."""
+        if should_apply_wan_ti2v(batch, server_args):
             latents = blend_wan_ti2v_latents(latents, reserved_frames_mask, z)
+        elif should_apply_lingbot_ti2v(batch, server_args):
+            assert z is not None, "LingBot TI2V requires a condition latent."
+            latents = apply_condition_latent(latents, z)
 
         return latents
 
