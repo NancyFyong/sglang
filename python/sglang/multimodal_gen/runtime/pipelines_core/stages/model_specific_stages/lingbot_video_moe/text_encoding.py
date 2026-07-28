@@ -4,6 +4,7 @@ import torch
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.ti2v import (
     build_vlm_image,
@@ -127,10 +128,17 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
 
         inputs = self._build_prompt_inputs(prompt, images=images)
         inputs = inputs.to(device)
-        outputs = text_encoder(
-            **inputs,
-            output_hidden_states=self.hidden_state_skip_layer is not None,
-        )
+        # SGLang's native Qwen3-VL builds its attention out of `LocalAttention`,
+        # which reads the forward context; the transformers fallback does not.
+        # Without this the native encoder dies with "Forward context is not set".
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            outputs = text_encoder(
+                **inputs,
+                output_hidden_states=self.hidden_state_skip_layer is not None,
+                # Only hidden states are used; keeping one token's logits avoids a
+                # `seq_len x 151936` projection whose result is thrown away.
+                logits_to_keep=1,
+            )
         if self.hidden_state_skip_layer is not None:
             prompt_embeds = outputs.hidden_states[-(self.hidden_state_skip_layer + 1)]
         else:

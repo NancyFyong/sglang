@@ -150,6 +150,9 @@ class Req:
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
+    # Clean vae-encoded condition frame that a TI2V model pins into `latents`
+    # instead of concatenating along the channel dim (see `image_latent`).
+    condition_latent: torch.Tensor | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
     c2ws_plucker_emb: torch.Tensor | None = None
 

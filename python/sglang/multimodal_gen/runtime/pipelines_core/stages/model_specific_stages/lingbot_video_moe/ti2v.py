@@ -129,6 +129,12 @@ def preprocess_condition_pixels(
     *requested* output resolution instead of deriving one from the image aspect
     ratio, and it resizes with bilinear interpolation on the raw uint8 tensor.
 
+    The interpolation deliberately runs on ``uint8`` rather than on a float copy:
+    Torch's uint8 bilinear kernel rounds every output pixel back to an integer,
+    so promoting to float first shifts up to 1/255 on ~all pixels. That feeds
+    both the VAE condition latent and the Qwen3-VL vision tower, where the
+    difference is amplified into visibly different prompt embeddings.
+
     Returns a ``(1, 3, 1, height, width)`` float tensor in ``[0, 1]``.
     """
 
@@ -143,11 +149,11 @@ def preprocess_condition_pixels(
     new_height = max(math.ceil(old_height * scale), height)
     new_width = max(math.ceil(old_width * scale), width)
     resized = F.interpolate(
-        raw.float(), size=(new_height, new_width), mode="bilinear", align_corners=False
+        raw, size=(new_height, new_width), mode="bilinear", align_corners=False
     )
     top = int(round((new_height - height) / 2.0))
     left = int(round((new_width - width) / 2.0))
-    cropped = resized[:, :, top : top + height, left : left + width] / 255.0
+    cropped = resized[:, :, top : top + height, left : left + width].float() / 255.0
     return cropped.unsqueeze(2)
 
 
@@ -166,7 +172,9 @@ def build_vlm_image(pixels: torch.Tensor, vision_patch_size: int) -> Image.Image
     return image.resize((resized_width, resized_height))
 
 
-def _single_generator(batch: Req) -> torch.Generator | None:
+def single_generator(batch: Req) -> torch.Generator | None:
+    """Return the single generator of a batch-of-one request."""
+
     if isinstance(batch.generator, list):
         assert len(batch.generator) == 1
         return batch.generator[0]
@@ -177,7 +185,6 @@ def encode_condition_latent(
     *,
     vae: object,
     pixels: torch.Tensor,
-    vae_dtype: torch.dtype,
     generator: torch.Generator | None,
     scale: torch.Tensor,
     shift: torch.Tensor,
@@ -187,15 +194,24 @@ def encode_condition_latent(
     ``scale``/``shift`` come from ``get_decode_scale_and_shift()``, i.e.
     ``(1 / latents_std, latents_mean)``, so the result is
     ``(z - mean) / std`` in fp32 — matching the reference implementation.
+
+    The reference pipeline keeps the VAE weights in fp32 but runs this encode
+    under a bf16 autocast, which makes ``latent_dist`` bf16 and therefore makes
+    ``sample()`` draw bf16 noise. Both the values *and* the number of generator
+    offsets consumed depend on that dtype, and the initial latent noise is drawn
+    from the same generator right afterwards, so the autocast is reproduced here
+    verbatim instead of being derived from ``vae_precision``.
     """
 
     device = get_local_torch_device()
     pixels = pixels.to(device=device, dtype=torch.float32)
     # The VAE expects [-1, 1] pixels; `preprocess_condition_pixels` yields [0, 1].
     norm_pixels = (pixels - 0.5) / 0.5
-    latent_dist = vae.encode(norm_pixels.to(dtype=vae_dtype))
-    latents = latent_dist.sample(generator).float()
-    return (latents - shift) * scale
+    with torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+    ):
+        latents = vae.encode(norm_pixels).sample(generator)
+    return (latents.float() - shift) * scale
 
 
 def apply_condition_latent(
@@ -219,24 +235,23 @@ def apply_condition_latent(
     )
 
 
-def prepare_lingbot_ti2v_latents(
-    *,
-    vae: object,
-    latents: torch.Tensor,
-    vae_dtype: torch.dtype,
-    batch: Req,
-    server_args: ServerArgs,
-) -> torch.Tensor:
-    """Encode the condition frame and pin it to the first latent frame.
+def pin_lingbot_ti2v_condition(*, latents: torch.Tensor, batch: Req) -> torch.Tensor:
+    """Pin the pre-encoded condition latent to the first latent frame.
 
-    Rebinds ``batch.latents`` and returns the condition latent so the denoising
-    loop can re-pin it after every scheduler step.
+    ``LingBotVideoConditionLatentStage`` produced ``batch.condition_latent``
+    *before* the initial noise was drawn, because the reference pipeline samples
+    the VAE posterior off the same generator first. Rebinds ``batch.latents``
+    and returns the condition latent so the denoising loop can re-pin it after
+    every scheduler step.
     """
 
     # LingBot replaces the first latent frame instead of concatenating along the
     # channel dim, so an image latent from ImageVAEEncodingStage would be wrong.
     assert batch.image_latent is None, "TI2V task should not have image latents"
-    assert vae is not None, "VAE is not provided for TI2V task"
+    condition_latent = batch.condition_latent
+    assert (
+        condition_latent is not None
+    ), "LingBotVideoConditionLatentStage must run before the denoising loop"
     if get_sp_world_size() > 1:
         raise NotImplementedError(
             "LingBot-Video MoE TI2V does not support sequence parallelism yet: "
@@ -244,20 +259,6 @@ def prepare_lingbot_ti2v_latents(
             "the owning SP rank only. Run with --ulysses-degree 1 --ring-degree 1."
         )
 
-    pixels = preprocess_condition_pixels(
-        get_condition_pil_image(batch), height=int(batch.height), width=int(batch.width)
-    )
-    scale, shift = server_args.pipeline_config.get_decode_scale_and_shift(
-        get_local_torch_device(), torch.float32, vae
-    )
-    condition_latent = encode_condition_latent(
-        vae=vae,
-        pixels=pixels,
-        vae_dtype=vae_dtype,
-        generator=_single_generator(batch),
-        scale=scale,
-        shift=shift,
-    )
     batch.latents = apply_condition_latent(latents, condition_latent).to(
         get_local_torch_device()
     )

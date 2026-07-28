@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.l
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.ti2v import (
     apply_condition_latent,
     encode_condition_latent,
+    pin_lingbot_ti2v_condition,
     preprocess_condition_pixels,
     should_apply_lingbot_ti2v,
 )
@@ -462,6 +463,26 @@ def test_condition_pixels_honor_requested_resolution():
     assert float(pixels.min()) >= 0.0 and float(pixels.max()) <= 1.0
 
 
+def test_condition_pixels_resize_in_uint8_like_the_reference():
+    """The reference resizes the raw uint8 tensor, not a float copy.
+
+    Torch's uint8 bilinear kernel rounds each output pixel back to an integer, so
+    every value must land exactly on a 1/255 grid point. Interpolating in float
+    instead shifts ~all pixels by up to 1/255, which propagates into the VAE
+    condition latent and the Qwen3-VL vision tokens — this turns red if someone
+    "cleans up" the uint8 input by promoting it first.
+    """
+    generator = torch.Generator().manual_seed(0)
+    noise = torch.randint(
+        0, 256, (67, 121, 3), dtype=torch.uint8, generator=generator
+    ).numpy()
+
+    pixels = preprocess_condition_pixels(Image.fromarray(noise), height=96, width=160)
+
+    scaled = pixels * 255.0
+    torch.testing.assert_close(scaled, scaled.round(), rtol=0, atol=1e-4)
+
+
 def test_condition_pixels_center_crop_keeps_the_middle():
     # Left third black, middle third white, right third black. A center crop to a
     # square keeps the white band centered; an off-by-one crop would skew it.
@@ -504,7 +525,6 @@ def test_encode_condition_latent_applies_vae_normalization(monkeypatch):
     latent = encode_condition_latent(
         vae=_VAE(),
         pixels=torch.full((1, 3, 1, 2, 2), 0.75),
-        vae_dtype=torch.float32,
         generator=generator,
         scale=scale,
         shift=shift,
@@ -531,6 +551,92 @@ def test_apply_condition_latent_rebinds_instead_of_writing_in_place():
     torch.testing.assert_close(latents, original)  # rebind-only, no slice write
     torch.testing.assert_close(out[:, :, :1], condition)
     torch.testing.assert_close(out[:, :, 1:], original[:, :, 1:])
+
+
+def test_pin_condition_requires_the_condition_latent_from_its_own_stage(monkeypatch):
+    """The denoising loop consumes a condition latent it did not encode itself.
+
+    Turns red if the encode step is moved back into the loop (which would break
+    generator ordering, see the next test) or if the stage stops running.
+    """
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
+        ti2v,
+    )
+
+    monkeypatch.setattr(ti2v, "get_local_torch_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(ti2v, "get_sp_world_size", lambda: 1)
+
+    latents = torch.randn(1, 16, 21, 4, 4)
+    condition = torch.randn(1, 16, 1, 4, 4)
+    batch = SimpleNamespace(image_latent=None, condition_latent=condition, latents=None)
+
+    returned = pin_lingbot_ti2v_condition(latents=latents, batch=batch)
+
+    assert returned is condition
+    torch.testing.assert_close(batch.latents[:, :, :1], condition)
+    torch.testing.assert_close(batch.latents[:, :, 1:], latents[:, :, 1:])
+
+    batch.condition_latent = None
+    try:
+        pin_lingbot_ti2v_condition(latents=latents, batch=batch)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("a missing condition latent must not pass silently")
+
+
+def test_ti2v_pipeline_encodes_the_condition_before_drawing_noise(monkeypatch):
+    """Stage order is numerically load-bearing, not cosmetic.
+
+    The reference pipeline samples the condition frame's VAE posterior off the
+    seeded generator *before* it draws the initial latent noise, so both the
+    values and the consumed generator offsets depend on this order. Mounting the
+    condition stage after latent preparation silently changes the whole
+    trajectory for a fixed seed.
+    """
+    from sglang.multimodal_gen.runtime.pipelines import lingbot_video_moe as pipelines
+    from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+        ComposedPipelineBase,
+    )
+
+    order = []
+
+    for attr in (
+        "InputValidationStage",
+        "LingBotVideoTextEncodingStage",
+        "LingBotVideoConditionLatentStage",
+        "DenoisingStage",
+    ):
+        monkeypatch.setattr(pipelines, attr, lambda *_, _name=attr, **__: _name)
+    monkeypatch.setattr(ComposedPipelineBase, "get_module", lambda self, name: name)
+    monkeypatch.setattr(
+        ComposedPipelineBase, "add_stage", lambda self, stage: order.append(stage)
+    )
+    for method in (
+        "add_standard_latent_preparation_stage",
+        "add_standard_timestep_preparation_stage",
+        "add_standard_decoding_stage",
+    ):
+        monkeypatch.setattr(
+            ComposedPipelineBase,
+            method,
+            lambda self, _name=method, **__: order.append(_name),
+        )
+
+    t2v = object.__new__(pipelines.LingBotVideoPipeline)
+    t2v.create_pipeline_stages(server_args=SimpleNamespace())
+    assert "LingBotVideoConditionLatentStage" not in order
+
+    order.clear()
+    ti2v_pipeline = object.__new__(pipelines.LingBotVideoImageToVideoPipeline)
+    ti2v_pipeline.create_pipeline_stages(server_args=SimpleNamespace())
+
+    assert order.index("LingBotVideoConditionLatentStage") < order.index(
+        "add_standard_latent_preparation_stage"
+    )
+    assert order.index("add_standard_latent_preparation_stage") < order.index(
+        "DenoisingStage"
+    )
 
 
 class _RecordingQwenProcessor(_FakeQwenProcessor):
@@ -651,3 +757,126 @@ def test_vlm_image_patch_size_comes_from_the_processor():
         )
         is None
     )
+
+
+def test_qwen3vl_text_attention_honors_the_explicit_head_dim(monkeypatch):
+    """``head_dim`` is a config field of its own, not ``hidden / num_heads``.
+
+    LingBot-Video's Qwen3-VL is 2560-wide with 32 heads of 128, so deriving the
+    head dim gives 80 and builds q/k/v projections that the checkpoint cannot
+    load into ("weight [1024, 2560] into parameter [640, 2560]"), silently
+    dropping the whole native encoder in favour of the transformers fallback.
+    """
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+
+    from sglang.multimodal_gen.runtime.models.encoders import qwen3vl
+
+    monkeypatch.setattr(qwen3vl, "LocalAttention", lambda **kwargs: kwargs)
+    config = Qwen3VLTextConfig(
+        hidden_size=2560,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        num_hidden_layers=1,
+    )
+
+    attention = qwen3vl.Qwen3VLTextAttention(config, layer_idx=0)
+
+    assert attention.head_dim == 128
+    assert tuple(attention.q_proj.weight.shape) == (4096, 2560)
+    assert tuple(attention.k_proj.weight.shape) == (1024, 2560)
+    assert tuple(attention.v_proj.weight.shape) == (1024, 2560)
+    assert tuple(attention.o_proj.weight.shape) == (2560, 4096)
+
+
+def _tied_head_encoder(tie_word_embeddings: bool):
+    """Minimal stand-in that exercises the real ``load_weights`` tying branch."""
+    from sglang.multimodal_gen.runtime.models.encoders import qwen3vl
+
+    class _Encoder(torch.nn.Module):
+        load_weights = qwen3vl.Qwen3VLForConditionalGeneration.load_weights
+
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.language_model = torch.nn.Module()
+            self.model.language_model.embed_tokens = torch.nn.Embedding(6, 4)
+            self.lm_head = torch.nn.Linear(4, 6, bias=False)
+            self.config = SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    text_config=SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
+                )
+            )
+
+    return _Encoder()
+
+
+def test_qwen3vl_ties_the_lm_head_when_the_checkpoint_omits_it():
+    """A ``tie_word_embeddings`` checkpoint ships no ``lm_head.weight``.
+
+    Without tying, the strict loader raises "weights were not initialized from
+    checkpoint: ['lm_head.weight']" and the whole native encoder is dropped for
+    the transformers fallback.
+    """
+    encoder = _tied_head_encoder(tie_word_embeddings=True)
+    weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+    loaded = encoder.load_weights(
+        [("model.language_model.embed_tokens.weight", weight)]
+    )
+
+    assert "lm_head.weight" in loaded
+    assert encoder.lm_head.weight is encoder.model.language_model.embed_tokens.weight
+    assert torch.equal(encoder.lm_head.weight, weight)
+
+
+def test_qwen3vl_leaves_an_untied_lm_head_to_the_checkpoint():
+    """Untied checkpoints carry their own head — tying it would corrupt it."""
+    encoder = _tied_head_encoder(tie_word_embeddings=False)
+    head = encoder.lm_head.weight
+
+    loaded = encoder.load_weights(
+        [("model.language_model.embed_tokens.weight", torch.zeros(6, 4))]
+    )
+
+    assert "lm_head.weight" not in loaded
+    assert encoder.lm_head.weight is head
+
+
+def test_qwen3vl_hidden_states_end_with_the_final_norm(monkeypatch):
+    """``hidden_states[-1]`` must be the post-norm state, as transformers does.
+
+    LingBot-Video reads ``hidden_states[-(skip_layer + 1)]``, so collecting layer
+    *outputs* (and never the post-norm state) hands the DiT un-normalised
+    embeddings — same shapes, ~2.5x the scale, silently wrong video.
+    """
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+
+    from sglang.multimodal_gen.runtime.models.encoders import qwen3vl
+
+    class _PassThroughAttention(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def forward(self, query, key, value):
+            return query
+
+    monkeypatch.setattr(qwen3vl, "LocalAttention", _PassThroughAttention)
+    config = Qwen3VLTextConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_hidden_layers=3,
+        intermediate_size=64,
+        vocab_size=64,
+    )
+    model = qwen3vl.Qwen3VLTextModel(config).eval()
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids=torch.randint(0, 64, (1, 5)), output_hidden_states=True
+        )
+
+    assert len(outputs.hidden_states) == config.num_hidden_layers + 1
+    assert torch.equal(outputs.hidden_states[-1], outputs.last_hidden_state)
