@@ -661,6 +661,16 @@ TI2V_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
 )
 
+LINGBOT_VIDEO_TI2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=LINGBOT_VIDEO_T2V_CI_PROMPT,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="384x640",
+    num_frames=17,
+    fps=16,
+    extras={"num_inference_steps": 12, "seed": 0},
+)
+
 SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=TI2V_sampling_params.prompt,
     image_path=TI2V_sampling_params.image_path,

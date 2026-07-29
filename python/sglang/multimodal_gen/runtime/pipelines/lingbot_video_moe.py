@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
+    LingBotVideoMoETI2VConfig,
+)
+from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
+    LingBotVideoMoETI2VSamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -9,6 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe import (
+    LingBotVideoConditionLatentStage,
     LingBotVideoTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -35,6 +42,9 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         "scheduler",
     )
 
+    def _add_condition_latent_stage(self) -> None:
+        """T2V has no condition frame; the TI2V subclass overrides this."""
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         self.add_stage(InputValidationStage())
         self.add_stage(
@@ -44,6 +54,9 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
                 transformer=self.get_module("transformer"),
             ),
         )
+        # Must precede latent preparation: the condition frame's VAE posterior is
+        # sampled off the same generator that draws the initial noise.
+        self._add_condition_latent_stage()
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
             prepare_extra_kwargs=[_flow_shift_kwarg],
@@ -57,4 +70,20 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_decoding_stage()
 
 
-EntryClass = [LingBotVideoPipeline]
+class LingBotVideoImageToVideoPipeline(LingBotVideoPipeline):
+    """TI2V variant: same stages, plus first-frame conditioning.
+
+    No ``ImageVAEEncodingStage`` is mounted on purpose: LingBot pins a clean
+    condition latent into the first latent frame instead of concatenating an
+    image latent along the channel dim.
+    """
+
+    pipeline_name = "LingBotVideoImageToVideoPipeline"
+    pipeline_config_cls = LingBotVideoMoETI2VConfig
+    sampling_params_cls = LingBotVideoMoETI2VSamplingParams
+
+    def _add_condition_latent_stage(self) -> None:
+        self.add_stage(LingBotVideoConditionLatentStage(vae=self.get_module("vae")))
+
+
+EntryClass = [LingBotVideoPipeline, LingBotVideoImageToVideoPipeline]

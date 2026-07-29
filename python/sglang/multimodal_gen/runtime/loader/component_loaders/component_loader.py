@@ -419,6 +419,14 @@ class ComponentLoader(ABC):
         ):
             transformers_or_diffusers = "diffusers"
 
+        # LingBot-Video declares its transformer and scheduler as remote-code
+        # modules in model_index.json; both have native implementations here,
+        # resolved by class name through the regular diffusers loaders.
+        if transformers_or_diffusers.startswith(
+            ("lingbot_video.", "lingbot_video_diffusers.")
+        ):
+            transformers_or_diffusers = "diffusers"
+
         return transformers_or_diffusers
 
     @classmethod

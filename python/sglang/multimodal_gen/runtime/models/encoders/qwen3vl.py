@@ -208,7 +208,10 @@ class Qwen3VLTextAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        # `head_dim` is an independent config field, not `hidden_size /
+        # num_attention_heads`: LingBot-Video's Qwen3-VL is 2560 wide with 32
+        # heads of 128, so deriving it sizes q/k/v projections wrong.
+        self.head_dim = config.head_dim
         self.total_num_heads = config.num_attention_heads
         self.total_num_key_value_heads = config.num_key_value_heads
         tp_size = _tp_world_size() if use_tensor_parallel else 1
@@ -598,6 +601,12 @@ class Qwen3VLTextModel(nn.Module):
         all_self_attns = () if output_attentions else None
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # Collect layer *inputs* plus the final post-norm state below, as
+            # transformers does: `num_layers + 1` entries with
+            # `all_hidden_states[-1] == last_hidden_state`, since callers index
+            # this tuple from the right.
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -619,10 +628,10 @@ class Qwen3VLTextModel(nn.Module):
                     visual_pos_masks,
                     deepstack_visual_embeds[layer_idx],
                 )
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
 
         hidden_states = self.norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
 
         if not return_dict:
             return tuple(
@@ -1136,6 +1145,9 @@ class Qwen3VLModel(nn.Module):
         return output if return_dict else output.to_tuple()
 
 
+_EMBED_TOKENS_WEIGHT = "model.language_model.embed_tokens.weight"
+
+
 class Qwen3VLForConditionalGeneration(TextEncoder):
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
@@ -1260,6 +1272,12 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
             loaded_weight = loaded_weight.to(param.dtype)
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # `tie_word_embeddings` checkpoints ship no `lm_head.weight`; share the
+        # embedding parameter instead of leaving it uninitialized.
+        if self.config.arch_config.text_config.tie_word_embeddings:
+            self.lm_head.weight = params_dict[_EMBED_TOKENS_WEIGHT]
+            loaded_params.add("lm_head.weight")
         return loaded_params
 
 

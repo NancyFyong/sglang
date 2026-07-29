@@ -84,3 +84,20 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
             1, -1, 1, 1, 1
         )
         return 1.0 / std, mean
+
+
+@dataclass
+class LingBotVideoMoETI2VConfig(LingBotVideoMoEPipelineConfig):
+    """TI2V (first-frame conditioned) variant of LingBot-Video MoE."""
+
+    task_type: ModelTaskType = ModelTaskType.TI2V
+    # LingBot crops the condition frame to the *requested* resolution, unlike the
+    # Wan TI2V branch in InputValidationStage which derives its own output size.
+    skip_input_image_preprocess: bool = True
+    # The condition latent is pinned for the whole schedule instead of being
+    # denoised, so an encode-side rounding error would never wash out.
+    vae_precision: str = "fp32"
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.vae_config.load_encoder = True

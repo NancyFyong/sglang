@@ -84,6 +84,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.ti2v import (
+    apply_condition_latent,
+    pin_lingbot_ti2v_condition,
+    should_apply_lingbot_ti2v,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v import (
     blend_wan_ti2v_latents,
     expand_wan_ti2v_timestep,
@@ -857,6 +862,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     batch,
                     server_args,
                 )
+        elif should_apply_lingbot_ti2v(batch, server_args):
+            # No mask and the timestep stays scalar; the clean condition latent
+            # is just pinned onto the first latent frame.
+            seq_len, reserved_frames_masks = None, None
+            z = pin_lingbot_ti2v_condition(latents=latents, batch=batch)
         else:
             seq_len, z, reserved_frames_masks = (
                 None,
@@ -1502,10 +1512,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def post_forward_for_ti2v_task(
         self, batch: Req, server_args: ServerArgs, reserved_frames_mask, latents, z
     ):
-        """Re-apply Wan TI2V first-frame conditioning after each denoising step."""
-        should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
-        if should_preprocess_for_wan_ti2v:
+        """Re-apply TI2V first-frame conditioning after each denoising step."""
+        if should_apply_wan_ti2v(batch, server_args):
             latents = blend_wan_ti2v_latents(latents, reserved_frames_mask, z)
+        elif should_apply_lingbot_ti2v(batch, server_args):
+            assert z is not None, "LingBot TI2V requires a condition latent."
+            latents = apply_condition_latent(latents, z)
 
         return latents
 

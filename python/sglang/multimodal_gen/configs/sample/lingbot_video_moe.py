@@ -18,3 +18,13 @@ class LingBotVideoMoESamplingParams(SamplingParams):
     flow_shift: float = 3.0
     negative_prompt: str | None = DEFAULT_NEGATIVE_PROMPT
     seed: int = 0
+
+
+@dataclass
+class LingBotVideoMoETI2VSamplingParams(LingBotVideoMoESamplingParams):
+    """Defaults mirroring the upstream ``scripts/single-gpu/run_moe_ti2v.sh``."""
+
+    height: int = 480
+    width: int = 832
+    fps: int = 24
+    guidance_scale: float = 3.0
