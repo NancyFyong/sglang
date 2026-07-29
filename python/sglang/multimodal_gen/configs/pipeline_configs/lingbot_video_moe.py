@@ -88,28 +88,16 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
 
 @dataclass
 class LingBotVideoMoETI2VConfig(LingBotVideoMoEPipelineConfig):
-    """TI2V (first-frame conditioned) variant of LingBot-Video MoE.
-
-    The condition frame is consumed twice: as a visual token block for the
-    Qwen3-VL text encoder, and as a clean VAE latent pinned to the first
-    latent frame before sampling and after every scheduler step. The DiT is
-    unchanged (``in_channels == out_channels``), so there is no channel-wise
-    image concat and no mask channel.
-    """
+    """TI2V (first-frame conditioned) variant of LingBot-Video MoE."""
 
     task_type: ModelTaskType = ModelTaskType.TI2V
-    # LingBot resizes/crops the condition frame to the *requested* resolution,
-    # unlike the Wan TI2V branch in InputValidationStage which derives its own
-    # output size from the image aspect ratio. Keep the PIL image untouched and
-    # preprocess it in the LingBot TI2V helpers instead.
+    # LingBot crops the condition frame to the *requested* resolution, unlike the
+    # Wan TI2V branch in InputValidationStage which derives its own output size.
     skip_input_image_preprocess: bool = True
-    # The reference implementation runs the VAE in fp32. The condition latent is
-    # pinned for the whole schedule instead of being denoised, so an encode-side
-    # rounding error would never wash out.
+    # The condition latent is pinned for the whole schedule instead of being
+    # denoised, so an encode-side rounding error would never wash out.
     vae_precision: str = "fp32"
 
     def __post_init__(self):
         super().__post_init__()
-        # The condition frame has to be VAE-encoded, so unlike T2V the encoder
-        # half of the VAE must be loaded.
         self.vae_config.load_encoder = True

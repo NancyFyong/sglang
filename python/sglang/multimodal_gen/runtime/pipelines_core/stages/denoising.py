@@ -863,9 +863,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     server_args,
                 )
         elif should_apply_lingbot_ti2v(batch, server_args):
-            # LingBot pins the clean condition latent that
-            # LingBotVideoConditionLatentStage already encoded onto the first
-            # latent frame; there is no mask and the timestep stays scalar.
+            # No mask and the timestep stays scalar; the clean condition latent
+            # is just pinned onto the first latent frame.
             seq_len, reserved_frames_masks = None, None
             z = pin_lingbot_ti2v_condition(latents=latents, batch=batch)
         else:

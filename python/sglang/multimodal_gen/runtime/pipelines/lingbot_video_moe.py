@@ -54,9 +54,8 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
                 transformer=self.get_module("transformer"),
             ),
         )
-        # Ordering is load-bearing: the condition frame's VAE posterior is
-        # sampled off the same generator that draws the initial noise, and the
-        # reference pipeline does it in this order.
+        # Must precede latent preparation: the condition frame's VAE posterior is
+        # sampled off the same generator that draws the initial noise.
         self._add_condition_latent_stage()
         self.add_standard_latent_preparation_stage()
         self.add_standard_timestep_preparation_stage(
@@ -74,12 +73,9 @@ class LingBotVideoPipeline(LoRAPipeline, ComposedPipelineBase):
 class LingBotVideoImageToVideoPipeline(LingBotVideoPipeline):
     """TI2V variant: same stages, plus first-frame conditioning.
 
-    No ``ImageVAEEncodingStage`` is mounted on purpose: LingBot replaces the
-    first latent frame with a clean condition latent instead of concatenating an
-    image latent along the channel dim, and DenoisingStage rejects
-    ``batch.image_latent`` for TI2V. ``LingBotVideoConditionLatentStage``
-    produces that condition latent, and DenoisingStage pins it before the loop
-    and re-pins it after every scheduler step.
+    No ``ImageVAEEncodingStage`` is mounted on purpose: LingBot pins a clean
+    condition latent into the first latent frame instead of concatenating an
+    image latent along the channel dim.
     """
 
     pipeline_name = "LingBotVideoImageToVideoPipeline"

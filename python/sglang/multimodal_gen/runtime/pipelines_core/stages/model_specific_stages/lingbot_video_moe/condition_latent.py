@@ -1,13 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""VAE encoding of the LingBot-Video MoE TI2V condition frame.
-
-This is a separate stage rather than a step inside ``DenoisingStage`` because of
-generator ordering: the reference pipeline samples the VAE posterior of the
-condition frame *before* it draws the initial latent noise, and both draws come
-from the same seeded generator. Encoding inside the denoising loop would leave
-the noise as the first draw and produce a completely different trajectory for
-the same seed.
-"""
+"""VAE encoding of the LingBot-Video MoE TI2V condition frame."""
 
 import torch
 
@@ -31,8 +23,9 @@ from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 class LingBotVideoConditionLatentStage(PipelineStage):
     """Encode the TI2V condition frame into ``batch.condition_latent``.
 
-    Must be mounted *before* the latent preparation stage; see the module
-    docstring for why the ordering is load-bearing.
+    Must run before latent preparation: the reference pipeline samples the VAE
+    posterior off the request generator before it draws the initial noise, and
+    the draw order fixes both values and generator offsets.
     """
 
     deduplicated_output_fields = ("condition_latent",)

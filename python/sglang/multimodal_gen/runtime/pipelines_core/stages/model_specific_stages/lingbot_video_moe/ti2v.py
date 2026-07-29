@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""LingBot-Video MoE TI2V (first-frame conditioned) helpers.
-
-LingBot's TI2V recipe differs from Wan's I2V recipe: the DiT is untouched
-(``in_channels == out_channels``), so there is no channel-wise image concat and
-no mask channel. Instead the condition frame is consumed twice:
-
-1. as a visual token block for the Qwen3-VL text encoder (both the positive and
-   the negative prompt), see :mod:`.text_encoding`;
-2. as a *clean* VAE latent pinned to the first latent frame before sampling and
-   again after every scheduler step.
-
-Numerics here mirror the reference ``LingBotVideoImageToVideoPipeline``.
-"""
+"""LingBot-Video MoE TI2V-specific helpers shared by the generic denoising stage."""
 
 import math
 
@@ -31,9 +19,6 @@ from sglang.multimodal_gen.runtime.distributed import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-# Qwen3-VL vision-token budget used by the reference pipeline. The condition
-# frame is resized to a multiple of ``patch_size * SPATIAL_MERGE_SIZE`` so the
-# processor can be called with ``do_resize=False``.
 IMAGE_MIN_TOKEN_NUM = 4
 IMAGE_MAX_TOKEN_NUM = 16384
 MAX_RATIO = 200
@@ -51,12 +36,7 @@ def should_apply_lingbot_ti2v(batch: Req, server_args: ServerArgs) -> bool:
 
 
 def get_condition_pil_image(batch: Req) -> Image.Image:
-    """Return the single condition frame as a PIL image.
-
-    ``LingBotVideoMoETI2VConfig`` sets ``skip_input_image_preprocess``, so
-    ``InputValidationStage`` leaves ``batch.condition_image`` as the loaded PIL
-    image (or a one-element list of them).
-    """
+    """Return the single un-preprocessed condition frame as a PIL image."""
 
     image = batch.condition_image
     if isinstance(image, list):
@@ -87,11 +67,7 @@ def smart_resize(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
 ) -> tuple[int, int]:
-    """Round ``(height, width)`` to a multiple of ``factor`` within a pixel budget.
-
-    Same rounding order as the Qwen-VL utility the reference pipeline calls, so
-    the number of vision tokens matches upstream exactly.
-    """
+    """Round ``(height, width)`` to a multiple of ``factor`` within a pixel budget."""
 
     if max_pixels is None:
         max_pixels = IMAGE_MAX_TOKEN_NUM * factor**2
@@ -123,21 +99,10 @@ def smart_resize(
 def preprocess_condition_pixels(
     image: Image.Image, height: int, width: int
 ) -> torch.Tensor:
-    """Scale-to-cover then center-crop the condition frame to ``height x width``.
+    """Scale-to-cover then center-crop the condition frame to ``(1, 3, 1, H, W)`` in [0, 1]."""
 
-    Unlike the Wan TI2V branch of ``InputValidationStage``, LingBot honours the
-    *requested* output resolution instead of deriving one from the image aspect
-    ratio, and it resizes with bilinear interpolation on the raw uint8 tensor.
-
-    The interpolation deliberately runs on ``uint8`` rather than on a float copy:
-    Torch's uint8 bilinear kernel rounds every output pixel back to an integer,
-    so promoting to float first shifts up to 1/255 on ~all pixels. That feeds
-    both the VAE condition latent and the Qwen3-VL vision tower, where the
-    difference is amplified into visibly different prompt embeddings.
-
-    Returns a ``(1, 3, 1, height, width)`` float tensor in ``[0, 1]``.
-    """
-
+    # Interpolate on uint8, not on a float copy: the uint8 bilinear kernel rounds
+    # every output pixel back to an integer, so promoting first shifts ~all pixels.
     raw = (
         torch.from_numpy(np.array(image.convert("RGB")))
         .permute(2, 0, 1)
@@ -189,24 +154,13 @@ def encode_condition_latent(
     scale: torch.Tensor,
     shift: torch.Tensor,
 ) -> torch.Tensor:
-    """VAE-encode the single condition frame into a normalized clean latent.
-
-    ``scale``/``shift`` come from ``get_decode_scale_and_shift()``, i.e.
-    ``(1 / latents_std, latents_mean)``, so the result is
-    ``(z - mean) / std`` in fp32 — matching the reference implementation.
-
-    The reference pipeline keeps the VAE weights in fp32 but runs this encode
-    under a bf16 autocast, which makes ``latent_dist`` bf16 and therefore makes
-    ``sample()`` draw bf16 noise. Both the values *and* the number of generator
-    offsets consumed depend on that dtype, and the initial latent noise is drawn
-    from the same generator right afterwards, so the autocast is reproduced here
-    verbatim instead of being derived from ``vae_precision``.
-    """
+    """VAE-encode the single condition frame into a normalized clean latent."""
 
     device = get_local_torch_device()
     pixels = pixels.to(device=device, dtype=torch.float32)
-    # The VAE expects [-1, 1] pixels; `preprocess_condition_pixels` yields [0, 1].
     norm_pixels = (pixels - 0.5) / 0.5
+    # The bf16 autocast makes `sample()` draw bf16 noise, which fixes both its
+    # values and how many generator offsets it consumes before the initial noise.
     with torch.autocast(
         device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
     ):
@@ -217,11 +171,7 @@ def encode_condition_latent(
 def apply_condition_latent(
     latents: torch.Tensor, condition_latent: torch.Tensor
 ) -> torch.Tensor:
-    """Pin ``condition_latent`` to the leading latent frames, out of place.
-
-    The reference pipeline writes ``latents[:, :, :cond_t] = cond`` in place;
-    ``Req`` fields are rebind-only here, so rebuild the tensor instead.
-    """
+    """Pin ``condition_latent`` to the leading latent frames, out of place."""
 
     assert latents.ndim == 5 and condition_latent.ndim == 5
     condition_frames = condition_latent.shape[2]
@@ -236,14 +186,7 @@ def apply_condition_latent(
 
 
 def pin_lingbot_ti2v_condition(*, latents: torch.Tensor, batch: Req) -> torch.Tensor:
-    """Pin the pre-encoded condition latent to the first latent frame.
-
-    ``LingBotVideoConditionLatentStage`` produced ``batch.condition_latent``
-    *before* the initial noise was drawn, because the reference pipeline samples
-    the VAE posterior off the same generator first. Rebinds ``batch.latents``
-    and returns the condition latent so the denoising loop can re-pin it after
-    every scheduler step.
-    """
+    """Pin the pre-encoded condition latent to the first latent frame."""
 
     # LingBot replaces the first latent frame instead of concatenating along the
     # channel dim, so an image latent from ImageVAEEncodingStage would be wrong.

@@ -468,9 +468,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
-        # T2V and TI2V ship in the same HF repo, so the path detector always
-        # resolves the T2V config; --pipeline-class-name is what selects the
-        # TI2V pipeline and its config subclass.
         "lingbot_video_moe_ti2v",
         DiffusionServerArgs(
             model_path="robbyant/lingbot-video-moe-30b-a3b",

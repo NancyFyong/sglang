@@ -209,9 +209,8 @@ class Qwen3VLTextAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         # `head_dim` is an independent config field, not `hidden_size /
-        # num_attention_heads`: LingBot-Video's Qwen3-VL has hidden_size 2560
-        # with 32 heads of 128 (not 80), and deriving it would build q/k/v
-        # projections of the wrong width.
+        # num_attention_heads`: LingBot-Video's Qwen3-VL is 2560 wide with 32
+        # heads of 128, so deriving it sizes q/k/v projections wrong.
         self.head_dim = config.head_dim
         self.total_num_heads = config.num_attention_heads
         self.total_num_key_value_heads = config.num_key_value_heads
@@ -602,12 +601,10 @@ class Qwen3VLTextModel(nn.Module):
         all_self_attns = () if output_attentions else None
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
-            # Transformers records the *input* of every decoder layer and then
-            # the final post-norm state, so the tuple has `num_layers + 1`
-            # entries with `hidden_states[0]` the embeddings and
-            # `hidden_states[-1] == last_hidden_state`. Callers index it from the
-            # right (`hidden_states[-(skip_layer + 1)]`), so collecting the layer
-            # *outputs* here instead would silently hand back a pre-norm state.
+            # Collect layer *inputs* plus the final post-norm state below, as
+            # transformers does: `num_layers + 1` entries with
+            # `all_hidden_states[-1] == last_hidden_state`, since callers index
+            # this tuple from the right.
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             hidden_states = decoder_layer(
@@ -1276,9 +1273,8 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        # `tie_word_embeddings` checkpoints (e.g. LingBot-Video's Qwen3-VL) ship
-        # no `lm_head.weight`; share the embedding parameter so the strict
-        # "weights not initialized from checkpoint" check does not trip.
+        # `tie_word_embeddings` checkpoints ship no `lm_head.weight`; share the
+        # embedding parameter instead of leaving it uninitialized.
         if self.config.arch_config.text_config.tie_word_embeddings:
             self.lm_head.weight = params_dict[_EMBED_TOKENS_WEIGHT]
             loaded_params.add("lm_head.weight")

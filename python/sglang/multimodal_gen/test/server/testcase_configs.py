@@ -661,8 +661,6 @@ TI2V_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
 )
 
-# LingBot expects the structured JSON prompt even in TI2V mode; the condition
-# frame is an extra input, not a replacement for the caption.
 LINGBOT_VIDEO_TI2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=LINGBOT_VIDEO_T2V_CI_PROMPT,
     image_path=TI2V_sampling_params.image_path,

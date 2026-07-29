@@ -41,12 +41,7 @@ VIDEO_PROMPT_TEMPLATE = "<|vision_start|><|video_pad|><|vision_end|>"
 
 
 class LingBotVideoTextEncodingStage(TextEncodingStage):
-    """Qwen3-VL prompt/negative encoding for LingBot-Video MoE (T2V and TI2V).
-
-    For TI2V the condition frame is fed to Qwen3-VL as a visual token block
-    (``IMG_PROMPT_TEMPLATE`` prepended to the user text) for *both* the positive
-    and the negative prompt, matching the reference implementation.
-    """
+    """Qwen3-VL prompt/negative encoding for LingBot-Video MoE (T2V and TI2V)."""
 
     def __init__(self, text_encoders, tokenizers, transformer):
         super().__init__(text_encoders, tokenizers)
@@ -128,15 +123,14 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
 
         inputs = self._build_prompt_inputs(prompt, images=images)
         inputs = inputs.to(device)
-        # SGLang's native Qwen3-VL builds its attention out of `LocalAttention`,
-        # which reads the forward context; the transformers fallback does not.
-        # Without this the native encoder dies with "Forward context is not set".
+        # SGLang's native Qwen3-VL attention reads the forward context, unlike
+        # the transformers fallback.
         with set_forward_context(current_timestep=0, attn_metadata=None):
             outputs = text_encoder(
                 **inputs,
                 output_hidden_states=self.hidden_state_skip_layer is not None,
-                # Only hidden states are used; keeping one token's logits avoids a
-                # `seq_len x 151936` projection whose result is thrown away.
+                # Only hidden states are used; keeping one token's logits avoids
+                # a `seq_len x 151936` projection whose result is thrown away.
                 logits_to_keep=1,
             )
         if self.hidden_state_skip_layer is not None:
@@ -170,11 +164,9 @@ class LingBotVideoTextEncodingStage(TextEncodingStage):
             height=int(batch.height),
             width=int(batch.width),
         )
-        # Read the patch size off the processor, not off the text encoder: the
-        # encoder is either SGLang's native Qwen3-VL or the transformers one
-        # (loader fallback), and only the processor exposes it the same way in
-        # both cases. It is also the value the processor itself patchifies with,
-        # which is what matters when we pass ``do_resize=False``.
+        # Read the patch size off the processor rather than the text encoder: it
+        # is the value the processor patchifies with, which is what matters when
+        # `do_resize=False`, and it does not depend on which encoder was loaded.
         image_processor = self.tokenizers[0].image_processor
         return [build_vlm_image(pixels, image_processor.patch_size)]
 
