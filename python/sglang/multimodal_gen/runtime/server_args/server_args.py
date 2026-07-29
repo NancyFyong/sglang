@@ -2227,6 +2227,7 @@ class ServerArgs(DisaggServerArgsMixin):
             "dp": "dp_size",
             "layerwise_offload_modules": "layerwise_offload_components",
             "mode": "performance_mode",
+            "pipeline": "pipeline_class_name",
         }
         for alias_name, dest_name in cli_aliases.items():
             if alias_name in provided_arg_names:
