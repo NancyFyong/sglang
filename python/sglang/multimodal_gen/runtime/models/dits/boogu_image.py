@@ -8,7 +8,16 @@ import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.boogu_image import BooguImageDitConfig
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_group,
+    get_sp_world_size,
+    get_tp_world_size,
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
@@ -27,6 +36,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -171,6 +181,92 @@ def apply_rope_per_sample(
     return q_out.view_as(q), k_out.view_as(k)
 
 
+def validate_sequence_parallel_config(sp_size: int, ring_size: int) -> None:
+    """Reject the sequence-parallel layouts this model cannot serve.
+
+    Boogu keeps the instruction stream replicated on every rank and shards only
+    the image stream, so its attention goes through the replicated-prefix path.
+    That path has no ring implementation -- it always ends in a local attention
+    call -- so a ring degree above 1 would silently drop every other rank's keys
+    instead of failing.
+    """
+    if sp_size > 1 and ring_size > 1:
+        raise ValueError(
+            "Boogu-Image sequence parallelism is Ulysses-only. The instruction "
+            "stream stays replicated on every rank, and the replicated-prefix "
+            "attention path it relies on has no ring implementation. Run with "
+            f"--ulysses-degree {sp_size} --ring-degree 1."
+        )
+
+
+def ulysses_kv_head_repeats(
+    num_heads: int, num_kv_heads: int, ulysses_size: int
+) -> int:
+    """How many times each KV head must be duplicated to survive Ulysses.
+
+    Ulysses shards the head axis across ranks, so both head counts have to divide
+    the Ulysses degree. Boogu runs 28 query heads over 7 KV heads, and 7 divides
+    neither 2 nor 4, so the KV side has to be widened. Duplicating each KV head
+    leaves the attention mathematically identical -- GQA already broadcasts one KV
+    head over several query heads -- as long as the duplication factor divides the
+    number of query heads per KV head, which keeps every query head paired with
+    the same KV head it had before. It always does: the widened count is
+    `lcm(num_kv_heads, ulysses_size)`, and both of those divide `num_heads`.
+    """
+    if ulysses_size <= 1:
+        return 1
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads "
+            f"({num_kv_heads})"
+        )
+    if num_heads % ulysses_size != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by the ulysses degree "
+            f"({ulysses_size})"
+        )
+    return ulysses_size // math.gcd(num_kv_heads, ulysses_size)
+
+
+def expand_kv_heads(tensor: torch.Tensor, repeats: int) -> torch.Tensor:
+    """Duplicate each head of a `[B, S, H, D]` key/value tensor `repeats` times."""
+    if repeats == 1:
+        return tensor
+    return tensor.repeat_interleave(repeats, dim=2)
+
+
+def pad_freqs_cis(
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor], pad: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Extend a (cos, sin) pair with identity rotations, as `_slice_freqs` does."""
+    if pad == 0:
+        return freqs_cis
+    cos, sin = freqs_cis
+    return (
+        torch.cat([cos, cos.new_ones(cos.shape[0], pad, cos.shape[2])], dim=1),
+        torch.cat([sin, sin.new_zeros(sin.shape[0], pad, sin.shape[2])], dim=1),
+    )
+
+
+def chunk_freqs_cis(
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor], num_chunks: int, chunk_index: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Take one contiguous chunk of a (cos, sin) pair along the sequence axis."""
+    cos, sin = freqs_cis
+    chunk_len = cos.shape[1] // num_chunks
+    start = chunk_index * chunk_len
+    return cos[:, start : start + chunk_len], sin[:, start : start + chunk_len]
+
+
+def shard_sequence(
+    tensor: torch.Tensor, num_chunks: int, chunk_index: int
+) -> torch.Tensor:
+    """Take one contiguous chunk of a `[B, S, D]` tensor along the sequence axis."""
+    batch_size, seq_len, dim = tensor.shape
+    chunks = tensor.view(batch_size, num_chunks, seq_len // num_chunks, dim)
+    return chunks[:, chunk_index].contiguous()
+
+
 class BooguAttention(nn.Module):
 
     def __init__(
@@ -198,6 +294,11 @@ class BooguAttention(nn.Module):
             )
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
+        self.kv_head_repeats = ulysses_kv_head_repeats(
+            num_heads=self.local_num_heads,
+            num_kv_heads=self.local_num_kv_heads,
+            ulysses_size=get_ulysses_parallel_world_size(),
+        )
         kv_dim = self.head_dim * num_kv_heads
 
         self.to_q = ColumnParallelLinear(
@@ -248,7 +349,7 @@ class BooguAttention(nn.Module):
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self.head_dim,
-            num_kv_heads=self.local_num_kv_heads,
+            num_kv_heads=self.local_num_kv_heads * self.kv_head_repeats,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -294,10 +395,19 @@ class BooguAttention(nn.Module):
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attn_mask_meta: Optional[dict] = None,
+        num_replicated_prefix: int = 0,
+        skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         q, k, v = self._qkv(hidden_states)
         q, k = self._norm_and_rope(q, k, freqs_cis)
-        out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta)
+        out = self.attn(
+            q,
+            expand_kv_heads(k, self.kv_head_repeats),
+            expand_kv_heads(v, self.kv_head_repeats),
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            skip_sequence_parallel_override=skip_sequence_parallel,
+        )
         out, _ = self.to_out[0](out.flatten(2))
         return out
 
@@ -375,6 +485,11 @@ class BooguJointAttention(nn.Module):
             )
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
+        self.kv_head_repeats = ulysses_kv_head_repeats(
+            num_heads=self.local_num_heads,
+            num_kv_heads=self.local_num_kv_heads,
+            ulysses_size=get_ulysses_parallel_world_size(),
+        )
 
         self.processor = BooguJointAttnProjections(
             dim=dim,
@@ -406,7 +521,7 @@ class BooguJointAttention(nn.Module):
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
             head_size=self.head_dim,
-            num_kv_heads=self.local_num_kv_heads,
+            num_kv_heads=self.local_num_kv_heads * self.kv_head_repeats,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
@@ -420,6 +535,8 @@ class BooguJointAttention(nn.Module):
         encoder_seq_lengths: List[int],
         seq_lengths: List[int],
         attn_mask_meta: Optional[dict] = None,
+        num_replicated_prefix: int = 0,
+        skip_sequence_parallel: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         p = self.processor
         img_q, _ = p.img_to_q(img_hidden_states)
@@ -463,7 +580,14 @@ class BooguJointAttention(nn.Module):
             )
         query, key = apply_rope_per_sample(query, key, freqs_cis)
 
-        joint = self.attn(query, key, value, attn_mask_meta=attn_mask_meta)
+        joint = self.attn(
+            query,
+            expand_kv_heads(key, self.kv_head_repeats),
+            expand_kv_heads(value, self.kv_head_repeats),
+            attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            skip_sequence_parallel_override=skip_sequence_parallel,
+        )
         joint = joint.flatten(2)
 
         instruct_out, img_out = split_instruct_image(
@@ -616,6 +740,8 @@ class BooguTransformerBlock(nn.Module):
         freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         temb: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
+        num_replicated_prefix: int = 0,
+        skip_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         if self.modulation:
             normed, gate_msa, scale_mlp, gate_mlp = self.norm1(hidden_states, temb)
@@ -623,6 +749,8 @@ class BooguTransformerBlock(nn.Module):
                 hidden_states=normed,
                 freqs_cis=freqs_cis,
                 attn_mask_meta=attn_mask_meta,
+                num_replicated_prefix=num_replicated_prefix,
+                skip_sequence_parallel=skip_sequence_parallel,
             )
             hidden_states = rmsnorm_tanh_mul_add(
                 attn_out, gate_msa.unsqueeze(1), hidden_states, self.norm2
@@ -638,6 +766,8 @@ class BooguTransformerBlock(nn.Module):
             hidden_states=self.norm1(hidden_states),
             freqs_cis=freqs_cis,
             attn_mask_meta=attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            skip_sequence_parallel=skip_sequence_parallel,
         )
         hidden_states = hidden_states + self.norm2(attn_out)
         mlp_out = self.feed_forward(self.ffn_norm1(hidden_states))
@@ -721,6 +851,8 @@ class BooguDoubleStreamBlock(nn.Module):
         seq_lengths: List[int],
         img_attn_mask_meta: Optional[dict] = None,
         joint_attn_mask_meta: Optional[dict] = None,
+        num_replicated_prefix: int = 0,
+        skip_sequence_parallel: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_norm1_out, img_gate_msa, img_scale_mlp, img_gate_mlp = self.img_norm1(
             img_hidden_states, temb
@@ -744,11 +876,14 @@ class BooguDoubleStreamBlock(nn.Module):
             encoder_seq_lengths=encoder_seq_lengths,
             seq_lengths=seq_lengths,
             attn_mask_meta=joint_attn_mask_meta,
+            num_replicated_prefix=num_replicated_prefix,
+            skip_sequence_parallel=skip_sequence_parallel,
         )
         img_self_attn_out = self.img_self_attn(
             hidden_states=img_norm3_out,
             freqs_cis=img_freqs_cis,
             attn_mask_meta=img_attn_mask_meta,
+            skip_sequence_parallel=skip_sequence_parallel,
         )
 
         img_hidden_states = rmsnorm_tanh_mul_add(
@@ -804,6 +939,28 @@ class BooguRopeBundle(msgspec.Struct, frozen=True):
     instruction_seq_lengths: List[int]
     seq_lengths: List[int]
     combined_img_seq_lengths: List[int]
+
+
+class BooguStreamLayout(msgspec.Struct, frozen=True):
+    """How the joint sequence is laid out for the 40 stream layers.
+
+    On one rank this is the model's global packing: per sample
+    `[instruct | image | pad]`. Under sequence parallelism only the image stream
+    is split across ranks, so each rank holds `[instruct | local image chunk]`
+    and the instruction tokens become a prefix that every rank shares --
+    `num_replicated_prefix` is what tells the attention not to gather them
+    `sp_size` times over.
+    """
+
+    img_seq_lengths: List[int]
+    encoder_seq_lengths: List[int]
+    seq_lengths: List[int]
+    img_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
+    joint_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
+    # 0 when the image stream is not sharded.
+    num_replicated_prefix: int = 0
+    # Image-stream length before padding and sharding, for the gather afterwards.
+    global_img_seq_len: int = 0
 
 
 class BooguRopeEmbedder(nn.Module):
@@ -1106,6 +1263,11 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         self.instruction_reduce_type = arch_config.instruction_reduce_type
         self.gradient_checkpointing = False
 
+        self.sp_size = get_sp_world_size()
+        validate_sequence_parallel_config(
+            sp_size=self.sp_size, ring_size=get_ring_parallel_world_size()
+        )
+
         patch_dim = self.patch_size * self.patch_size * self.in_channels
         self.x_embedder = ReplicatedLinear(patch_dim, self.dim, bias=True)
         self.ref_image_patch_embedder = ReplicatedLinear(patch_dim, self.dim, bias=True)
@@ -1195,6 +1357,7 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         ref_lengths: List[List[int]],
         rope: BooguRopeBundle,
         temb: torch.Tensor,
+        skip_sequence_parallel: bool,
     ) -> torch.Tensor:
         noise_hidden_states, _ = self.x_embedder(noise_tokens)
         noise_mask_meta = build_varlen_mask_meta_from_lengths(
@@ -1206,6 +1369,7 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 freqs_cis=rope.noise,
                 temb=temb,
                 attn_mask_meta=noise_mask_meta,
+                skip_sequence_parallel=skip_sequence_parallel,
             )
 
         if ref_tokens is None:
@@ -1241,6 +1405,7 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 freqs_cis=ref_freqs,
                 temb=torch.stack(flat_temb),
                 attn_mask_meta=ref_mask_meta,
+                skip_sequence_parallel=skip_sequence_parallel,
             )
 
         combined = []
@@ -1262,6 +1427,114 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 )
             )
         return torch.stack(combined)
+
+    def _sequence_shard_enabled(self, rope: BooguRopeBundle) -> bool:
+        """Whether this forward can split the image stream across the SP ranks.
+
+        A sharded row's instruction prefix has to be one fixed length, because the
+        attention takes the replicated prefix as a single token count. When the
+        batch mixes instruction lengths the shared prefix would have to cover the
+        longest one, which would feed every other row's instruction padding into
+        the joint attention as real tokens. Rather than change the numbers, fall
+        back to replicated compute -- correct, just not faster.
+        """
+        if self.sp_size == 1:
+            return False
+        forward_batch = get_forward_context().forward_batch
+        if forward_batch is None or not forward_batch.enable_sequence_shard:
+            return False
+        if len(set(rope.instruction_seq_lengths)) > 1:
+            logger.warning_once(
+                "Boogu-Image is running sequence parallelism replicated: the batch "
+                f"mixes instruction lengths {rope.instruction_seq_lengths}, and a "
+                "shared replicated prefix needs them uniform. Batch prompts of "
+                "equal token length to get the speedup."
+            )
+            return False
+        return True
+
+    def _layout_stream_inputs(
+        self,
+        img_hidden_states: torch.Tensor,
+        instruct_seq_len: int,
+        rope: BooguRopeBundle,
+        sequence_shard_enabled: bool,
+    ) -> Tuple[torch.Tensor, BooguStreamLayout]:
+        """Hand the stream layers their rank-local slice of the image stream.
+
+        Attention only depends on which RoPE a token carries, not on which slot or
+        rank it sits in, so splitting the image stream and slicing its freqs along
+        with it leaves the result unchanged. The instruction stream is left whole
+        on every rank: it is short, and replicating it is what lets each image
+        token still see all of it.
+
+        Sharded rows are laid out uniformly -- every row's image chunk starts at
+        `instruct_seq_len` -- because the attention takes the replicated prefix as
+        a single length. At the default batch size of 1 that is exactly the global
+        packing this returns unsharded.
+        """
+        if not sequence_shard_enabled:
+            return img_hidden_states, BooguStreamLayout(
+                img_seq_lengths=rope.combined_img_seq_lengths,
+                encoder_seq_lengths=rope.instruction_seq_lengths,
+                seq_lengths=rope.seq_lengths,
+                img_freqs_cis=rope.combined_img,
+                joint_freqs_cis=rope.joint,
+            )
+
+        batch_size, global_img_seq_len, _ = img_hidden_states.shape
+        pad = -global_img_seq_len % self.sp_size
+        if pad:
+            img_hidden_states = torch.cat(
+                [
+                    img_hidden_states,
+                    img_hidden_states.new_zeros(batch_size, pad, self.dim),
+                ],
+                dim=1,
+            )
+        img_freqs_cis = pad_freqs_cis(rope.combined_img, pad)
+
+        sp_rank = get_sp_group().rank_in_group
+        local_img = shard_sequence(img_hidden_states, self.sp_size, sp_rank)
+        local_img_freqs_cis = chunk_freqs_cis(img_freqs_cis, self.sp_size, sp_rank)
+        local_img_seq_len = local_img.shape[1]
+        local_cos, local_sin = local_img_freqs_cis
+        context_cos, context_sin = rope.context
+        return local_img, BooguStreamLayout(
+            img_seq_lengths=[local_img_seq_len] * batch_size,
+            encoder_seq_lengths=[instruct_seq_len] * batch_size,
+            seq_lengths=[instruct_seq_len + local_img_seq_len] * batch_size,
+            img_freqs_cis=local_img_freqs_cis,
+            joint_freqs_cis=(
+                torch.cat([context_cos, local_cos], dim=1),
+                torch.cat([context_sin, local_sin], dim=1),
+            ),
+            num_replicated_prefix=instruct_seq_len,
+            global_img_seq_len=global_img_seq_len,
+        )
+
+    def _gather_joint_sequence(
+        self,
+        joint_hidden_states: torch.Tensor,
+        layout: BooguStreamLayout,
+        rope: BooguRopeBundle,
+    ) -> torch.Tensor:
+        """Undo `_layout_stream_inputs`: collect the image shards, repack globally.
+
+        The output projection reads the image tokens out of the joint sequence by
+        per-sample offset, so hand it back the same global packing it sees on one
+        rank.
+        """
+        prefix = layout.num_replicated_prefix
+        img_hidden_states = sequence_model_parallel_all_gather(
+            joint_hidden_states[:, prefix:].contiguous(), dim=1
+        )
+        return interleave_instruct_image(
+            instruct=joint_hidden_states[:, :prefix],
+            img=img_hidden_states[:, : layout.global_img_seq_len],
+            encoder_seq_lengths=rope.instruction_seq_lengths,
+            seq_lengths=rope.seq_lengths,
+        )
 
     def forward(
         self,
@@ -1307,6 +1580,12 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             device=device,
         )
 
+        # The refiners always run replicated: they are ~5% of the layers, and the
+        # ref-image stream is packed against the *whole* noise stream, so there is
+        # nothing to shard before the double-stream layers anyway.
+        replicated_stage = self.sp_size > 1
+        sequence_shard_enabled = self._sequence_shard_enabled(rope)
+
         context_mask_meta = build_varlen_mask_meta_from_lengths(
             rope.instruction_seq_lengths, instruct_hidden_states.shape[1], device
         )
@@ -1315,6 +1594,7 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 hidden_states=instruct_hidden_states,
                 freqs_cis=rope.context,
                 attn_mask_meta=context_mask_meta,
+                skip_sequence_parallel=replicated_stage,
             )
 
         img_hidden_states = self._embed_and_refine_images(
@@ -1324,39 +1604,62 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             ref_lengths=ref_lengths,
             rope=rope,
             temb=temb,
+            skip_sequence_parallel=replicated_stage,
         )
 
+        img_hidden_states, layout = self._layout_stream_inputs(
+            img_hidden_states=img_hidden_states,
+            instruct_seq_len=instruct_hidden_states.shape[1],
+            rope=rope,
+            sequence_shard_enabled=sequence_shard_enabled,
+        )
+        # Sharded, the all-to-all inside the attention is what makes each rank see
+        # the whole sequence; unsharded at sp>1 every rank holds the whole thing
+        # already and must not communicate.
+        stream_replicated_stage = replicated_stage and not sequence_shard_enabled
+
         img_mask_meta = build_varlen_mask_meta_from_lengths(
-            rope.combined_img_seq_lengths, img_hidden_states.shape[1], device
+            layout.img_seq_lengths, img_hidden_states.shape[1], device
         )
         joint_mask_meta = build_varlen_mask_meta_from_lengths(
-            rope.seq_lengths, max(rope.seq_lengths), device
+            layout.seq_lengths, max(layout.seq_lengths), device
         )
         for layer in self.double_stream_layers:
             img_hidden_states, instruct_hidden_states = layer(
                 img_hidden_states=img_hidden_states,
                 instruct_hidden_states=instruct_hidden_states,
-                img_freqs_cis=rope.combined_img,
-                joint_freqs_cis=rope.joint,
+                img_freqs_cis=layout.img_freqs_cis,
+                joint_freqs_cis=layout.joint_freqs_cis,
                 temb=temb,
-                encoder_seq_lengths=rope.instruction_seq_lengths,
-                seq_lengths=rope.seq_lengths,
+                encoder_seq_lengths=layout.encoder_seq_lengths,
+                seq_lengths=layout.seq_lengths,
                 img_attn_mask_meta=img_mask_meta,
                 joint_attn_mask_meta=joint_mask_meta,
+                num_replicated_prefix=layout.num_replicated_prefix,
+                skip_sequence_parallel=stream_replicated_stage,
             )
 
         joint_hidden_states = interleave_instruct_image(
             instruct=instruct_hidden_states,
             img=img_hidden_states,
-            encoder_seq_lengths=rope.instruction_seq_lengths,
-            seq_lengths=rope.seq_lengths,
+            encoder_seq_lengths=layout.encoder_seq_lengths,
+            seq_lengths=layout.seq_lengths,
         )
         for layer in self.single_stream_layers:
             joint_hidden_states = layer(
                 hidden_states=joint_hidden_states,
-                freqs_cis=rope.joint,
+                freqs_cis=layout.joint_freqs_cis,
                 temb=temb,
                 attn_mask_meta=joint_mask_meta,
+                num_replicated_prefix=layout.num_replicated_prefix,
+                skip_sequence_parallel=stream_replicated_stage,
+            )
+
+        if sequence_shard_enabled:
+            joint_hidden_states = self._gather_joint_sequence(
+                joint_hidden_states=joint_hidden_states,
+                layout=layout,
+                rope=rope,
             )
 
         joint_hidden_states = self.norm_out(joint_hidden_states, temb)
