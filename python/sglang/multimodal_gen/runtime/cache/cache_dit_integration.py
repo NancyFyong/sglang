@@ -260,14 +260,14 @@ DUAL_TRANSFORMER_BLOCK_ADAPTER_SPECS: dict[str, DualTransformerBlockAdapterSpec]
 
 
 # Custom BlockAdapter for DiT models absent from cache-dit's BlockAdapterRegister.
-# Value: (blocks attr, forward_pattern). forward_pattern must
-# match the block's forward signature (see cache_dit.ForwardPattern; e.g., ERNIE
-# uses Pattern_3). has_separate_cfg follows the run (passed by
-# enable_cache_on_transformer); cache-dit auto-resolves the remaining
-# fields.
-_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[str, ForwardPattern]] = {
-    "ErnieImageTransformer2DModel": ("layers", ForwardPattern.Pattern_3),
-    "Krea2Transformer2DModel": ("transformer_blocks", ForwardPattern.Pattern_3),
+# Value: one (blocks attr, forward_pattern) pair per block list, in execution order.
+_CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, tuple[tuple[str, ForwardPattern], ...]] = {
+    "ErnieImageTransformer2DModel": (("layers", ForwardPattern.Pattern_3),),
+    "Krea2Transformer2DModel": (("transformer_blocks", ForwardPattern.Pattern_3),),
+    "BooguImageTransformer2DModel": (
+        ("double_stream_layers", ForwardPattern.Pattern_0),
+        ("single_stream_layers", ForwardPattern.Pattern_3),
+    ),
 }
 
 
@@ -280,17 +280,22 @@ def _build_custom_block_adapter(
     spec = _CUSTOM_BLOCK_ADAPTER_SPECS.get(transformer.__class__.__name__)
     if spec is None:
         return None
-    blocks_attr, forward_pattern = spec
-    blocks = getattr(transformer, blocks_attr, None)
-    if blocks is None:
-        raise ValueError(
-            f"Transformer {transformer.__class__.__name__} has no attribute "
-            f"{blocks_attr!r} for cache-dit blocks."
-        )
+    blocks = []
+    for blocks_attr, _ in spec:
+        block_list = getattr(transformer, blocks_attr, None)
+        if block_list is None:
+            raise ValueError(
+                f"Transformer {transformer.__class__.__name__} has no attribute "
+                f"{blocks_attr!r} for cache-dit blocks."
+            )
+        blocks.append(block_list)
+    forward_patterns = [forward_pattern for _, forward_pattern in spec]
+    if len(spec) == 1:
+        blocks, forward_patterns = blocks[0], forward_patterns[0]
     return BlockAdapter(
         transformer=transformer,
         blocks=blocks,
-        forward_pattern=forward_pattern,
+        forward_pattern=forward_patterns,
         has_separate_cfg=has_separate_cfg,
     )
 

@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -728,8 +729,8 @@ class BooguDoubleStreamBlock(nn.Module):
 
     def forward(
         self,
-        img_hidden_states: torch.Tensor,
-        instruct_hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
         img_freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         joint_freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         temb: torch.Tensor,
@@ -738,6 +739,8 @@ class BooguDoubleStreamBlock(nn.Module):
         img_attn_mask_meta: Optional[dict] = None,
         joint_attn_mask_meta: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_hidden_states = hidden_states
+        instruct_hidden_states = encoder_hidden_states
         img_norm1_out, img_gate_msa, img_scale_mlp, img_gate_mlp = self.img_norm1(
             img_hidden_states, temb
         )
@@ -1288,6 +1291,11 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         ref_image_hidden_states: Optional[List[List[torch.Tensor]]] = None,
         **kwargs,
     ) -> torch.Tensor:
+        forward_batch = get_forward_context().forward_batch
+        self.enable_teacache = (
+            forward_batch is not None and forward_batch.enable_teacache
+        )
+
         squeezed_frame_axis = hidden_states.dim() == 5
         if squeezed_frame_axis:
             hidden_states = hidden_states.squeeze(2)
@@ -1342,6 +1350,64 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             temb=temb,
         )
 
+        joint_hidden_states = self._run_stream_layers(
+            img_hidden_states=img_hidden_states,
+            instruct_hidden_states=instruct_hidden_states,
+            rope=rope,
+            temb=temb,
+            device=device,
+        )
+
+        joint_hidden_states = self.norm_out(joint_hidden_states, temb)
+        out = torch.stack(
+            [
+                unpatchify(
+                    joint_hidden_states[i, seq_len - img_len : seq_len],
+                    height=img_sizes[i][0],
+                    width=img_sizes[i][1],
+                    patch_size=self.patch_size,
+                    channels=self.out_channels,
+                )
+                for i, (seq_len, img_len) in enumerate(
+                    zip(rope.seq_lengths, img_lengths)
+                )
+            ]
+        )
+        if squeezed_frame_axis:
+            out = out.unsqueeze(2)
+        return out
+
+    def _run_stream_layers(
+        self,
+        img_hidden_states: torch.Tensor,
+        instruct_hidden_states: torch.Tensor,
+        rope: BooguRopeBundle,
+        temb: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Run the double- then single-stream layers, or reuse a cached residual.
+
+        TeaCache treats this whole span as one residual block: the interleaved
+        image+instruction sequence goes in, the refined sequence comes out, and
+        the difference between them is what gets cached across timesteps. Both
+        the pre-block interleave and the ada-LN `temb` are cheap, so a cache hit
+        skips all 40 stream layers.
+        """
+        should_skip = self.should_skip_forward_for_cached_states(temb=temb)
+        original_joint_hidden_states = (
+            interleave_instruct_image(
+                instruct=instruct_hidden_states,
+                img=img_hidden_states,
+                encoder_seq_lengths=rope.instruction_seq_lengths,
+                seq_lengths=rope.seq_lengths,
+            )
+            if self.enable_teacache
+            else None
+        )
+        self.cnt += 1
+        if should_skip:
+            return self.retrieve_cached_states(original_joint_hidden_states)
+
         img_mask_meta = build_varlen_mask_meta_from_lengths(
             rope.combined_img_seq_lengths, img_hidden_states.shape[1], device
         )
@@ -1350,8 +1416,8 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         )
         for layer in self.double_stream_layers:
             img_hidden_states, instruct_hidden_states = layer(
-                img_hidden_states=img_hidden_states,
-                instruct_hidden_states=instruct_hidden_states,
+                hidden_states=img_hidden_states,
+                encoder_hidden_states=instruct_hidden_states,
                 img_freqs_cis=rope.combined_img,
                 joint_freqs_cis=rope.joint,
                 temb=temb,
@@ -1375,24 +1441,46 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 attn_mask_meta=joint_mask_meta,
             )
 
-        joint_hidden_states = self.norm_out(joint_hidden_states, temb)
-        out = torch.stack(
-            [
-                unpatchify(
-                    joint_hidden_states[i, seq_len - img_len : seq_len],
-                    height=img_sizes[i][0],
-                    width=img_sizes[i][1],
-                    patch_size=self.patch_size,
-                    channels=self.out_channels,
-                )
-                for i, (seq_len, img_len) in enumerate(
-                    zip(rope.seq_lengths, img_lengths)
-                )
-            ]
+        if self.enable_teacache:
+            self.maybe_cache_states(joint_hidden_states, original_joint_hidden_states)
+        return joint_hidden_states
+
+    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        if not self.enable_teacache:
+            return False
+        ctx = self._get_teacache_context()
+        if ctx is None:
+            return False
+
+        start_skipping, end_skipping = ctx.teacache_params.get_skip_boundaries(
+            ctx.num_inference_steps, ctx.do_cfg
         )
-        if squeezed_frame_axis:
-            out = out.unsqueeze(2)
-        return out
+        is_boundary_step = self.cnt < start_skipping or self.cnt >= end_skipping
+        self.is_cfg_negative = ctx.is_cfg_negative
+
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=kwargs["temb"],
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+        return not should_calc
+
+    def maybe_cache_states(
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+    ) -> None:
+        """Cache the stream-layer residual, separately per CFG branch."""
+        residual = hidden_states - original_hidden_states
+        if self.is_cfg_negative:
+            self.previous_residual_negative = residual
+        else:
+            self.previous_residual = residual
+
+    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the cached stream-layer residual to the current input."""
+        if self.is_cfg_negative:
+            return hidden_states + self.previous_residual_negative
+        return hidden_states + self.previous_residual
 
 
 EntryClass = BooguImageTransformer2DModel

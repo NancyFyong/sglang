@@ -15,6 +15,7 @@ class _FakeDBCacheConfig:
 class _FakeForwardPattern:
     # A class (not a SimpleNamespace instance) so it is a valid type in
     # annotations like List[ForwardPattern], matching the real Enum.
+    Pattern_0 = "Pattern_0"
     Pattern_2 = "Pattern_2"
     Pattern_3 = "Pattern_3"
 
@@ -278,6 +279,28 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             transformer_turbo, has_separate_cfg=False
         )
         self.assertFalse(adapter_turbo.has_separate_cfg)
+
+
+class TestMultiBlockListAdapter(unittest.TestCase):
+    def test_boogu_image_keeps_one_pattern_per_block_list(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("BooguImageTransformer2DModel")
+        transformer.double_stream_layers = ["double_0", "double_1"]
+        transformer.single_stream_layers = ["single_0"]
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        self.assertEqual(adapter.blocks, [["double_0", "double_1"], ["single_0"]])
+        self.assertEqual(adapter.forward_pattern, ["Pattern_0", "Pattern_3"])
+
+    def test_single_block_list_stays_unwrapped(self):
+        module = _import_module_with_stub()
+        transformer = _make_transformer("ErnieImageTransformer2DModel", ["b0"])
+
+        adapter = module._build_custom_block_adapter(transformer)
+
+        self.assertEqual(adapter.blocks, ["b0"])
+        self.assertEqual(adapter.forward_pattern, "Pattern_3")
 
 
 if __name__ == "__main__":
