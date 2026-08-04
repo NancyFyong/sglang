@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.boogu_image import BooguImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import sp_shard_utils
 from sglang.multimodal_gen.runtime.models.dits import boogu_image
 from sglang.multimodal_gen.runtime.models.dits.boogu_image import (
@@ -367,6 +368,16 @@ class TestSequenceParallelConfigValidation(unittest.TestCase):
     def test_ulysses_only_and_single_gpu_are_accepted(self):
         validate_sequence_parallel_config(sp_size=4, ring_size=1)
         validate_sequence_parallel_config(sp_size=1, ring_size=1)
+
+    def test_packed_qkv_input_a2a_defaults_on(self):
+        # Boogu deliberately defaults this ON (every other model, and the
+        # conservative attention-constructor default, keep it OFF): the plain USP
+        # path is Boogu's default route, packing q/k/v into one all-to-all is
+        # bitwise-exact, and it measured ~1% faster. A future diff that flips the
+        # default OFF to "match the others" is a silent perf regression, so pin it.
+        self.assertTrue(
+            BooguImageDitConfig().arch_config.enable_packed_qkv_input_a2a
+        )
 
 
 if __name__ == "__main__":

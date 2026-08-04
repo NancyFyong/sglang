@@ -30,6 +30,10 @@ class BooguImageArchConfig(DiTArchConfig):
     axes_dims: Tuple[int, int, int] = (40, 40, 40)
     axes_lens: Tuple[int, int, int] = (2048, 1664, 1664)
     max_ref_images: int = 5
+    # Pack q/k/v into one stream-overlapped Ulysses all-to-all instead of three
+    # separate collectives on the plain USP path. Perf-only and numerically
+    # equivalent (an all-to-all is a pure permutation), so on by default.
+    enable_packed_qkv_input_a2a: bool = True
 
     _fsdp_shard_conditions: list = field(default_factory=lambda: [is_boogu_image_layer])
 

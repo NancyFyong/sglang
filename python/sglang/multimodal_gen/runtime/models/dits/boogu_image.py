@@ -282,6 +282,7 @@ class BooguAttention(nn.Module):
         num_kv_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-5,
+        enable_packed_qkv_input_a2a: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -292,6 +293,7 @@ class BooguAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
+        self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
 
         tp_size = get_tp_world_size()
         if num_heads % tp_size != 0 or num_kv_heads % tp_size != 0:
@@ -360,6 +362,7 @@ class BooguAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=self.head_dim**-0.5,
             causal=False,
+            enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
         )
 
     def _qkv(
@@ -485,6 +488,7 @@ class BooguJointAttention(nn.Module):
         num_kv_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-5,
+        enable_packed_qkv_input_a2a: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -493,6 +497,7 @@ class BooguJointAttention(nn.Module):
         self.head_dim = dim // num_heads
         self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.qk_norm = qk_norm
+        self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
 
         tp_size = get_tp_world_size()
         if num_heads % tp_size != 0 or num_kv_heads % tp_size != 0:
@@ -542,6 +547,7 @@ class BooguJointAttention(nn.Module):
             dropout_rate=0,
             softmax_scale=self.head_dim**-0.5,
             causal=False,
+            enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
         )
 
     def forward(
@@ -728,6 +734,7 @@ class BooguTransformerBlock(nn.Module):
         ffn_dim_multiplier: Optional[float],
         norm_eps: float,
         qk_norm: bool,
+        enable_packed_qkv_input_a2a: bool = False,
         modulation: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -740,6 +747,7 @@ class BooguTransformerBlock(nn.Module):
             num_kv_heads=num_kv_heads,
             qk_norm=qk_norm,
             eps=norm_eps,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
@@ -812,6 +820,7 @@ class BooguDoubleStreamBlock(nn.Module):
         ffn_dim_multiplier: Optional[float],
         norm_eps: float,
         qk_norm: bool,
+        enable_packed_qkv_input_a2a: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -828,6 +837,7 @@ class BooguDoubleStreamBlock(nn.Module):
             num_kv_heads=num_kv_heads,
             qk_norm=qk_norm,
             eps=norm_eps,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             quant_config=quant_config,
             prefix=f"{prefix}.img_instruct_attn",
         )
@@ -837,6 +847,7 @@ class BooguDoubleStreamBlock(nn.Module):
             num_kv_heads=num_kv_heads,
             qk_norm=qk_norm,
             eps=norm_eps,
+            enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             quant_config=quant_config,
             prefix=f"{prefix}.img_self_attn",
         )
@@ -1329,6 +1340,7 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             ffn_dim_multiplier=arch_config.ffn_dim_multiplier,
             norm_eps=arch_config.norm_eps,
             qk_norm=arch_config.qk_norm,
+            enable_packed_qkv_input_a2a=arch_config.enable_packed_qkv_input_a2a,
             quant_config=quant_config,
         )
 
