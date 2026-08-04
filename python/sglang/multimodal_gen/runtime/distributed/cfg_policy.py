@@ -44,6 +44,13 @@ class CFGPolicy:
 
     branches: list[CFGBranch] = field(default_factory=list)
 
+    # Combine the branches with the serial formula even under CFG parallel, so a
+    # CFG-parallel run is bitwise-identical to a single-GPU one.  Off by default
+    # because it changes the output of models whose baselines were recorded with
+    # the re-associated CFG-parallel arithmetic (see ``combine``); opt in from a
+    # pipeline config for models that have no such baseline to preserve.
+    exact_parallel_combine: bool = False
+
     def build(
         self,
         batch: Req,
@@ -83,11 +90,15 @@ class CFGPolicy:
             return predictions[0]
         pos_t = _wrap(predictions[0])
         neg_t = _wrap(predictions[1])
-        if cfg_parallel:
+        if cfg_parallel and not self.exact_parallel_combine:
             # Match the old CFG-parallel calculation: multiply the positive
             # prediction by cfg_scale and the negative prediction by
             # (1 - cfg_scale) before adding them. The serial CFG formula is
             # mathematically equivalent, but bf16 rounding changes WAN outputs.
+            # It is also ~15x less accurate per step at cfg_scale=4: below,
+            # ``p - n`` subtracts nearby values (exact in bf16) and scales by a
+            # power of two, while ``cfg_scale * p`` and ``(1 - cfg_scale) * n``
+            # are both several times larger than the result they cancel down to.
             results = [
                 cfg_scale * p + (1 - cfg_scale) * n for p, n in zip(pos_t, neg_t)
             ]

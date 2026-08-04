@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
 BOOGU_SYSTEM_PROMPT_T2I = (
     "You are a helpful assistant that generates high-quality images based on user "
@@ -73,6 +74,12 @@ class BooguImagePipelineConfig(ImagePipelineConfig):
 
     dit_config: DiTConfig = field(default_factory=BooguImageDitConfig)
     vae_config: VAEConfig = field(default_factory=BooguImageVAEConfig)
+
+    # Boogu has no recorded CFG-parallel baseline, so prefer the accurate combine:
+    # this makes --cfg-parallel-size 2 bitwise-identical to a single-GPU run.
+    cfg_policy: CFGPolicy = field(
+        default_factory=lambda: CFGPolicy(exact_parallel_combine=True)
+    )
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (BooguQwen3VLConfig(),)
