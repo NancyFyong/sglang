@@ -8,10 +8,12 @@ silently, on CPU with no distributed group.
 """
 
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import sp_shard_utils
 from sglang.multimodal_gen.runtime.models.dits import boogu_image
 from sglang.multimodal_gen.runtime.models.dits.boogu_image import (
     BooguImageTransformer2DModel,
@@ -205,6 +207,13 @@ def _bare_transformer(sp_size: int) -> BooguImageTransformer2DModel:
     return transformer
 
 
+def _instruct(seq_len: int, batch_size: int = 1, dim: int = 4) -> torch.Tensor:
+    # Distinct per (row, token, channel) so a wrong shard offset is visible.
+    return torch.arange(
+        batch_size * seq_len * dim, dtype=torch.float32
+    ).view(batch_size, seq_len, dim)
+
+
 class TestLayoutStreamInputs(unittest.TestCase):
     def test_unsharded_layout_is_the_global_packing(self):
         # At sp=1 the stream layers must see exactly what they saw before this
@@ -212,15 +221,19 @@ class TestLayoutStreamInputs(unittest.TestCase):
         transformer = _bare_transformer(sp_size=1)
         rope = _rope_bundle([3, 2], [5, 5])
         img = torch.zeros((2, 5, 4))
+        instruct = _instruct(3, batch_size=2)
 
-        local_img, layout = transformer._layout_stream_inputs(
+        local_img, local_instruct, layout = transformer._layout_stream_inputs(
             img_hidden_states=img,
-            instruct_seq_len=3,
+            instruct_hidden_states=instruct,
             rope=rope,
             sequence_shard_enabled=False,
+            text_shard_enabled=False,
         )
 
         self.assertIs(local_img, img)
+        self.assertIs(local_instruct, instruct)
+        self.assertFalse(layout.text_sharded)
         self.assertEqual(layout.num_replicated_prefix, 0)
         self.assertEqual(layout.encoder_seq_lengths, [3, 2])
         self.assertEqual(layout.seq_lengths, [8, 7])
@@ -230,6 +243,7 @@ class TestLayoutStreamInputs(unittest.TestCase):
         transformer = _bare_transformer(sp_size=2)
         rope = _rope_bundle([3], [8])
         img = torch.arange(8 * 4, dtype=torch.float32).view(1, 8, 4)
+        instruct = _instruct(3)
 
         shards = []
         for rank in range(2):
@@ -238,16 +252,19 @@ class TestLayoutStreamInputs(unittest.TestCase):
                 "get_sp_group",
                 return_value=type("G", (), {"rank_in_group": rank})(),
             ):
-                local_img, layout = transformer._layout_stream_inputs(
+                local_img, local_instruct, layout = transformer._layout_stream_inputs(
                     img_hidden_states=img,
-                    instruct_seq_len=3,
+                    instruct_hidden_states=instruct,
                     rope=rope,
                     sequence_shard_enabled=True,
+                    text_shard_enabled=False,
                 )
             shards.append(local_img)
             # The instruction stream stays whole, so the joint sequence each rank
             # holds is [instruct | its image shard], and everything before the
             # image shard is what the attention must not gather twice.
+            self.assertIs(local_instruct, instruct)
+            self.assertFalse(layout.text_sharded)
             self.assertEqual(layout.num_replicated_prefix, 3)
             self.assertEqual(layout.encoder_seq_lengths, [3])
             self.assertEqual(layout.img_seq_lengths, [4])
@@ -263,17 +280,19 @@ class TestLayoutStreamInputs(unittest.TestCase):
         transformer = _bare_transformer(sp_size=2)
         rope = _rope_bundle([3], [9])
         img = torch.ones((1, 9, 4))
+        instruct = _instruct(3)
 
         with patch.object(
             boogu_image,
             "get_sp_group",
             return_value=type("G", (), {"rank_in_group": 1})(),
         ):
-            local_img, layout = transformer._layout_stream_inputs(
+            local_img, _, layout = transformer._layout_stream_inputs(
                 img_hidden_states=img,
-                instruct_seq_len=3,
+                instruct_hidden_states=instruct,
                 rope=rope,
                 sequence_shard_enabled=True,
+                text_shard_enabled=False,
             )
 
         self.assertEqual(local_img.shape, (1, 5, 4))
@@ -282,6 +301,59 @@ class TestLayoutStreamInputs(unittest.TestCase):
         # identity rotation rather than a copy of a real token.
         torch.testing.assert_close(local_img[0, 4], torch.zeros(4))
         torch.testing.assert_close(layout.img_freqs_cis[0][0, 4], torch.ones(2))
+
+    def test_text_sharded_layout_splits_both_streams(self):
+        # With a divisible instruction length both streams split evenly, the
+        # replicated prefix drops to 0, and each rank's local joint is
+        # [instruct shard | image shard]. A wrong shard offset here returns a
+        # plausible wrong image, so pin that both streams reassemble contiguously
+        # and the local lengths add up.
+        transformer = _bare_transformer(sp_size=2)
+        rope = _rope_bundle([4], [8])
+        img = torch.arange(8 * 4, dtype=torch.float32).view(1, 8, 4)
+        instruct = _instruct(4)
+
+        img_shards, instruct_shards = [], []
+        for rank in range(2):
+            with ExitStack() as stack:
+                stack.enter_context(
+                    patch.object(
+                        boogu_image,
+                        "get_sp_group",
+                        return_value=type("G", (), {"rank_in_group": rank})(),
+                    )
+                )
+                # build_shard_plan reads the real (=1) world size on CPU, so pin
+                # both to this transformer's degree/rank.
+                stack.enter_context(
+                    patch.object(sp_shard_utils, "get_sp_world_size", return_value=2)
+                )
+                stack.enter_context(
+                    patch.object(sp_shard_utils, "get_sp_parallel_rank", return_value=rank)
+                )
+                local_img, local_instruct, layout = transformer._layout_stream_inputs(
+                    img_hidden_states=img,
+                    instruct_hidden_states=instruct,
+                    rope=rope,
+                    sequence_shard_enabled=True,
+                    text_shard_enabled=True,
+                )
+            img_shards.append(local_img)
+            instruct_shards.append(local_instruct)
+            self.assertTrue(layout.text_sharded)
+            self.assertEqual(layout.num_replicated_prefix, 0)
+            self.assertEqual(layout.encoder_seq_lengths, [2])
+            self.assertEqual(layout.img_seq_lengths, [4])
+            self.assertEqual(layout.seq_lengths, [6])
+            self.assertEqual(layout.global_img_seq_len, 8)
+            self.assertEqual(layout.global_instruct_len, 4)
+            # Local joint freqs cover [local instruct | local image] = 2 + 4.
+            self.assertEqual(layout.joint_freqs_cis[0].shape, (1, 6, 2))
+
+        # Both streams are contiguous shards, so rank order reassembles the input
+        # -- which is exactly what the all-gather at the end relies on.
+        torch.testing.assert_close(torch.cat(img_shards, dim=1), img)
+        torch.testing.assert_close(torch.cat(instruct_shards, dim=1), instruct)
 
 
 class TestSequenceParallelConfigValidation(unittest.TestCase):

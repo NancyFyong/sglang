@@ -18,6 +18,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+    should_shard_text,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
@@ -950,6 +956,12 @@ class BooguStreamLayout(msgspec.Struct, frozen=True):
     and the instruction tokens become a prefix that every rank shares --
     `num_replicated_prefix` is what tells the attention not to gather them
     `sp_size` times over.
+
+    When `text_sharded` is set the instruction stream is split across ranks too
+    (see `_text_shard_enabled`): each rank holds `[local instruct chunk | local
+    image chunk]`, `num_replicated_prefix` drops to 0 so the joint attention
+    takes the plain Ulysses all-to-all, and both streams are re-gathered
+    afterwards.
     """
 
     img_seq_lengths: List[int]
@@ -957,10 +969,16 @@ class BooguStreamLayout(msgspec.Struct, frozen=True):
     seq_lengths: List[int]
     img_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
     joint_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
-    # 0 when the image stream is not sharded.
+    # 0 when the image stream is not sharded, and also 0 when the instruction
+    # stream is sharded (text_sharded) -- both streams are then split evenly and
+    # nothing is replicated.
     num_replicated_prefix: int = 0
     # Image-stream length before padding and sharding, for the gather afterwards.
     global_img_seq_len: int = 0
+    # Whether the instruction stream is also sharded across ranks.
+    text_sharded: bool = False
+    # Instruction-stream length before sharding, for the gather afterwards.
+    global_instruct_len: int = 0
 
 
 class BooguRopeEmbedder(nn.Module):
@@ -1453,6 +1471,24 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             return False
         return True
 
+    def _text_shard_enabled(self, instruct_seq_len: int) -> bool:
+        """Whether the instruction stream can be split across ranks too.
+
+        Only reached when the image stream is already sharded. Boogu's 256-token
+        instruction stream divides every real SP degree, so `build_shard_plan`
+        adds no padding and the joint attention needs no tail-pad relocation --
+        the plain Ulysses all-to-all (`num_replicated_prefix=0`) is exact. When
+        the instruction length does not divide the SP degree the flux_2 tail-pad
+        path (`join_seqs` / `tail_attn_meta`) would be required and is not wired
+        here, so we fall back to the replicated-prefix path (correct, slower).
+        `SGLANG_SP_TEXT_SHARD_MIN` forces replication as an escape hatch back to
+        the bitwise-exact route.
+        """
+        return (
+            should_shard_text(instruct_seq_len)
+            and instruct_seq_len % self.sp_size == 0
+        )
+
     # Dynamo cannot reconstruct the msgspec.Struct this returns
     # ("object.__new__(BooguStreamLayout) is not safe"), and the sharding decision
     # it makes is data-dependent Python over sequence lengths, so it belongs outside
@@ -1461,30 +1497,37 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
     def _layout_stream_inputs(
         self,
         img_hidden_states: torch.Tensor,
-        instruct_seq_len: int,
+        instruct_hidden_states: torch.Tensor,
         rope: BooguRopeBundle,
         sequence_shard_enabled: bool,
-    ) -> Tuple[torch.Tensor, BooguStreamLayout]:
-        """Hand the stream layers their rank-local slice of the image stream.
+        text_shard_enabled: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, BooguStreamLayout]:
+        """Hand the stream layers their rank-local slice of each stream.
 
         Attention only depends on which RoPE a token carries, not on which slot or
-        rank it sits in, so splitting the image stream and slicing its freqs along
-        with it leaves the result unchanged. The instruction stream is left whole
-        on every rank: it is short, and replicating it is what lets each image
-        token still see all of it.
+        rank it sits in, so splitting a stream and slicing its freqs along with it
+        leaves the result unchanged. The image stream is always sharded here; the
+        instruction stream is sharded too when `text_shard_enabled` (its length
+        divides the SP degree, so the split is even and needs no tail padding),
+        otherwise it is left whole on every rank as a replicated prefix.
 
         Sharded rows are laid out uniformly -- every row's image chunk starts at
-        `instruct_seq_len` -- because the attention takes the replicated prefix as
-        a single length. At the default batch size of 1 that is exactly the global
-        packing this returns unsharded.
+        the (local) instruction length -- because the attention takes any
+        replicated prefix as a single length. At the default batch size of 1 the
+        unsharded return is exactly the model's global packing.
         """
+        instruct_seq_len = instruct_hidden_states.shape[1]
         if not sequence_shard_enabled:
-            return img_hidden_states, BooguStreamLayout(
-                img_seq_lengths=rope.combined_img_seq_lengths,
-                encoder_seq_lengths=rope.instruction_seq_lengths,
-                seq_lengths=rope.seq_lengths,
-                img_freqs_cis=rope.combined_img,
-                joint_freqs_cis=rope.joint,
+            return (
+                img_hidden_states,
+                instruct_hidden_states,
+                BooguStreamLayout(
+                    img_seq_lengths=rope.combined_img_seq_lengths,
+                    encoder_seq_lengths=rope.instruction_seq_lengths,
+                    seq_lengths=rope.seq_lengths,
+                    img_freqs_cis=rope.combined_img,
+                    joint_freqs_cis=rope.joint,
+                ),
             )
 
         batch_size, global_img_seq_len, _ = img_hidden_states.shape
@@ -1505,17 +1548,52 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         local_img_seq_len = local_img.shape[1]
         local_cos, local_sin = local_img_freqs_cis
         context_cos, context_sin = rope.context
-        return local_img, BooguStreamLayout(
-            img_seq_lengths=[local_img_seq_len] * batch_size,
-            encoder_seq_lengths=[instruct_seq_len] * batch_size,
-            seq_lengths=[instruct_seq_len + local_img_seq_len] * batch_size,
-            img_freqs_cis=local_img_freqs_cis,
-            joint_freqs_cis=(
-                torch.cat([context_cos, local_cos], dim=1),
-                torch.cat([context_sin, local_sin], dim=1),
+
+        if not text_shard_enabled:
+            # Image-only sharding: the instruction stream stays replicated on
+            # every rank and rides the joint attention as a shared prefix.
+            return (
+                local_img,
+                instruct_hidden_states,
+                BooguStreamLayout(
+                    img_seq_lengths=[local_img_seq_len] * batch_size,
+                    encoder_seq_lengths=[instruct_seq_len] * batch_size,
+                    seq_lengths=[instruct_seq_len + local_img_seq_len] * batch_size,
+                    img_freqs_cis=local_img_freqs_cis,
+                    joint_freqs_cis=(
+                        torch.cat([context_cos, local_cos], dim=1),
+                        torch.cat([context_sin, local_sin], dim=1),
+                    ),
+                    num_replicated_prefix=instruct_seq_len,
+                    global_img_seq_len=global_img_seq_len,
+                ),
+            )
+
+        # Text sharding: split the instruction stream (and its RoPE) evenly too.
+        # The length divides the SP degree, so `build_shard_plan` adds no pad and
+        # `shard_like` is a contiguous slice -- no relocation or tail masking.
+        txt_shard = build_shard_plan(instruct_seq_len)
+        local_instruct = shard_like(instruct_hidden_states, txt_shard, dim=1)
+        local_ctx_cos = shard_like(context_cos, txt_shard, dim=1)
+        local_ctx_sin = shard_like(context_sin, txt_shard, dim=1)
+        local_instruct_len = local_instruct.shape[1]
+        return (
+            local_img,
+            local_instruct,
+            BooguStreamLayout(
+                img_seq_lengths=[local_img_seq_len] * batch_size,
+                encoder_seq_lengths=[local_instruct_len] * batch_size,
+                seq_lengths=[local_instruct_len + local_img_seq_len] * batch_size,
+                img_freqs_cis=local_img_freqs_cis,
+                joint_freqs_cis=(
+                    torch.cat([local_ctx_cos, local_cos], dim=1),
+                    torch.cat([local_ctx_sin, local_sin], dim=1),
+                ),
+                num_replicated_prefix=0,
+                global_img_seq_len=global_img_seq_len,
+                text_sharded=True,
+                global_instruct_len=instruct_seq_len,
             ),
-            num_replicated_prefix=instruct_seq_len,
-            global_img_seq_len=global_img_seq_len,
         )
 
     def _gather_joint_sequence(
@@ -1524,12 +1602,27 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         layout: BooguStreamLayout,
         rope: BooguRopeBundle,
     ) -> torch.Tensor:
-        """Undo `_layout_stream_inputs`: collect the image shards, repack globally.
+        """Undo `_layout_stream_inputs`: collect the shards, repack globally.
 
         The output projection reads the image tokens out of the joint sequence by
         per-sample offset, so hand it back the same global packing it sees on one
         rank.
         """
+        if layout.text_sharded:
+            # Both streams are sharded: each rank holds `[local instruct | local
+            # image]`. All-gather each contiguously-sharded stream back to its
+            # global length (`gather_seq` trims the image's SP padding), then
+            # repack into the model's `[instruct | image | pad]` layout.
+            local_instruct_len = layout.encoder_seq_lengths[0]
+            instruct_local = joint_hidden_states[:, :local_instruct_len]
+            img_local = joint_hidden_states[:, local_instruct_len:]
+            return interleave_instruct_image(
+                instruct=gather_seq(instruct_local, layout.global_instruct_len, dim=1),
+                img=gather_seq(img_local, layout.global_img_seq_len, dim=1),
+                encoder_seq_lengths=rope.instruction_seq_lengths,
+                seq_lengths=rope.seq_lengths,
+            )
+
         prefix = layout.num_replicated_prefix
         img_hidden_states = sequence_model_parallel_all_gather(
             joint_hidden_states[:, prefix:].contiguous(), dim=1
@@ -1590,6 +1683,9 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         # nothing to shard before the double-stream layers anyway.
         replicated_stage = self.sp_size > 1
         sequence_shard_enabled = self._sequence_shard_enabled(rope)
+        text_shard_enabled = sequence_shard_enabled and self._text_shard_enabled(
+            instruct_hidden_states.shape[1]
+        )
 
         context_mask_meta = build_varlen_mask_meta_from_lengths(
             rope.instruction_seq_lengths, instruct_hidden_states.shape[1], device
@@ -1612,11 +1708,12 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             skip_sequence_parallel=replicated_stage,
         )
 
-        img_hidden_states, layout = self._layout_stream_inputs(
+        img_hidden_states, instruct_hidden_states, layout = self._layout_stream_inputs(
             img_hidden_states=img_hidden_states,
-            instruct_seq_len=instruct_hidden_states.shape[1],
+            instruct_hidden_states=instruct_hidden_states,
             rope=rope,
             sequence_shard_enabled=sequence_shard_enabled,
+            text_shard_enabled=text_shard_enabled,
         )
         # Sharded, the all-to-all inside the attention is what makes each rank see
         # the whole sequence; unsharded at sp>1 every rank holds the whole thing
