@@ -288,6 +288,7 @@ class BooguAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // num_heads
+        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
@@ -354,7 +355,7 @@ class BooguAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
-            head_size=self.head_dim,
+            head_size=self._padded_head_dim,
             num_kv_heads=self.local_num_kv_heads * self.kv_head_repeats,
             dropout_rate=0,
             softmax_scale=self.head_dim**-0.5,
@@ -406,6 +407,13 @@ class BooguAttention(nn.Module):
     ) -> torch.Tensor:
         q, k, v = self._qkv(hidden_states)
         q, k = self._norm_and_rope(q, k, freqs_cis)
+        # Boogu's head_dim=120 is not an FA-supported bucket; pad to 128 (the
+        # softmax_scale still uses the true 120) and slice the padding back off.
+        pad = self._padded_head_dim - self.head_dim
+        if pad:
+            q = nn.functional.pad(q, (0, pad))
+            k = nn.functional.pad(k, (0, pad))
+            v = nn.functional.pad(v, (0, pad))
         out = self.attn(
             q,
             expand_kv_heads(k, self.kv_head_repeats),
@@ -414,6 +422,8 @@ class BooguAttention(nn.Module):
             num_replicated_prefix=num_replicated_prefix,
             skip_sequence_parallel_override=skip_sequence_parallel,
         )
+        if pad:
+            out = out[..., : self.head_dim]
         out, _ = self.to_out[0](out.flatten(2))
         return out
 
@@ -481,6 +491,7 @@ class BooguJointAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // num_heads
+        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
         self.qk_norm = qk_norm
 
         tp_size = get_tp_world_size()
@@ -526,7 +537,7 @@ class BooguJointAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
-            head_size=self.head_dim,
+            head_size=self._padded_head_dim,
             num_kv_heads=self.local_num_kv_heads * self.kv_head_repeats,
             dropout_rate=0,
             softmax_scale=self.head_dim**-0.5,
@@ -586,6 +597,14 @@ class BooguJointAttention(nn.Module):
             )
         query, key = apply_rope_per_sample(query, key, freqs_cis)
 
+        # Boogu's head_dim=120 is not an FA-supported bucket; pad to 128 (the
+        # softmax_scale still uses the true 120) and slice the padding back off.
+        pad = self._padded_head_dim - self.head_dim
+        if pad:
+            query = nn.functional.pad(query, (0, pad))
+            key = nn.functional.pad(key, (0, pad))
+            value = nn.functional.pad(value, (0, pad))
+
         joint = self.attn(
             query,
             expand_kv_heads(key, self.kv_head_repeats),
@@ -594,6 +613,8 @@ class BooguJointAttention(nn.Module):
             num_replicated_prefix=num_replicated_prefix,
             skip_sequence_parallel_override=skip_sequence_parallel,
         )
+        if pad:
+            joint = joint[..., : self.head_dim]
         joint = joint.flatten(2)
 
         instruct_out, img_out = split_instruct_image(
