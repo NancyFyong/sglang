@@ -334,7 +334,15 @@ class FlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [32, 64, 96, 128, 160, 192, 224, 256]
+        # Every multiple of 8 up to 256, which is what the kernel behind
+        # flash_attn_varlen_func actually accepts (verified for fa_ver 3 on H20
+        # and for flash_attn 2.8.3: all 32 sizes pass). The former list of
+        # multiples of 32 came from vLLM, where it describes a paged-attention
+        # constraint that does not apply here -- and because FA is the default
+        # backend on CUDA, it silently downgraded any model whose head_dim is a
+        # multiple of 8 but not of 32 (e.g. Boogu-Image at 3360/28 = 120) onto
+        # torch_sdpa.
+        return list(range(8, 257, 8))
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
