@@ -1453,6 +1453,11 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             return False
         return True
 
+    # Dynamo cannot reconstruct the msgspec.Struct this returns
+    # ("object.__new__(BooguStreamLayout) is not safe"), and the sharding decision
+    # it makes is data-dependent Python over sequence lengths, so it belongs outside
+    # the graph regardless. The stream layers after it still compile.
+    @torch.compiler.disable
     def _layout_stream_inputs(
         self,
         img_hidden_states: torch.Tensor,
