@@ -35,7 +35,13 @@ def _worker() -> int:
     )
 
     rank = int(os.environ["RANK"])
-    torch.cuda.set_device(rank)
+    # Place the pair on devices {2, 3} when the box has them, not {0, 1}: that is
+    # the layout --cfg-parallel-size 2 --ulysses-degree 2 produces for the second
+    # CFG group, and it is what regressed when the transport assumed the peer was
+    # `1 - dev` (negative for dev >= 2). On a 2-GPU box this stays {0, 1}.
+    dev_base = 2 if torch.cuda.device_count() >= 4 else 0
+    dev = dev_base + rank
+    torch.cuda.set_device(dev)
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=1, sp_size=_WORLD, ulysses_degree=_WORLD
     )
@@ -48,7 +54,7 @@ def _worker() -> int:
         _usp_output_all_to_all,
     )
 
-    if not torch.cuda.can_device_access_peer(rank, 1 - rank):
+    if not torch.cuda.can_device_access_peer(dev, dev_base + (1 - rank)):
         print("SKIP no peer-to-peer access between the two devices", flush=True)
         return 0
 

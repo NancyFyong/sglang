@@ -137,10 +137,18 @@ class IpcA2AState:
 
         self.rank = dist.get_rank(group=group)
         dev = torch.cuda.current_device()
-        if not torch.cuda.can_device_access_peer(dev, 1 - dev):
+        # The two ranks in this group are not necessarily on devices {0, 1}:
+        # --cfg-parallel-size 2 --ulysses-degree 2 on 4 GPUs puts the second
+        # CFG group's Ulysses pair on devices {2, 3}, so the old `1 - dev` peer
+        # (negative for dev >= 2) tripped "Invalid peer device id" and silently
+        # dropped that group onto NCCL. Ask the peer for its real device index.
+        devs = [None, None]
+        dist.all_gather_object(devs, dev, group=group)
+        peer_dev = devs[1 - self.rank]
+        if not torch.cuda.can_device_access_peer(dev, peer_dev):
             raise _Unsupported("no peer-to-peer access between the two devices")
         # kernel-level dereference of peer mappings needs explicit peer access
-        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(1 - dev, 0)
+        ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
         build_dir = os.path.join(
             envs.SGLANG_DIFFUSION_CACHE_ROOT, f"ipc_a2a_sync_r{dev}"
         )
