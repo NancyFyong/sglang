@@ -37,6 +37,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
     LingBotWorldV2CausalDMDConfig,
+    MiniMaxH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -145,6 +146,7 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
@@ -830,6 +832,18 @@ def _register_configs():
             lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
         ],
     )
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: "minimaxh3"
+            in model_id.lower().replace("-", "").replace("_", "")
+        ],
+    )
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -886,7 +900,6 @@ def _register_configs():
         ],
         model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
     )
-    # Boogu-Image (base T2I only)
     register_configs(
         sampling_param_cls=BooguImageSamplingParams,
         pipeline_config_cls=BooguImagePipelineConfig,

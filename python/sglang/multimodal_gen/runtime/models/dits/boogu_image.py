@@ -351,7 +351,7 @@ class BooguAttention(nn.Module):
             head_size=self.head_dim,
             num_kv_heads=self.local_num_kv_heads * self.kv_head_repeats,
             dropout_rate=0,
-            softmax_scale=None,
+            softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
 
@@ -523,7 +523,7 @@ class BooguJointAttention(nn.Module):
             head_size=self.head_dim,
             num_kv_heads=self.local_num_kv_heads * self.kv_head_repeats,
             dropout_rate=0,
-            softmax_scale=None,
+            softmax_scale=self.head_dim**-0.5,
             causal=False,
         )
 
