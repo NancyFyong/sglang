@@ -137,11 +137,6 @@ class IpcA2AState:
 
         self.rank = dist.get_rank(group=group)
         dev = torch.cuda.current_device()
-        # The two ranks in this group are not necessarily on devices {0, 1}:
-        # --cfg-parallel-size 2 --ulysses-degree 2 on 4 GPUs puts the second
-        # CFG group's Ulysses pair on devices {2, 3}, so the old `1 - dev` peer
-        # (negative for dev >= 2) tripped "Invalid peer device id" and silently
-        # dropped that group onto NCCL. Ask the peer for its real device index.
         devs = [None, None]
         dist.all_gather_object(devs, dev, group=group)
         peer_dev = devs[1 - self.rank]

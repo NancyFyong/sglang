@@ -289,7 +289,7 @@ class BooguAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // num_heads
-        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
+        self._padded_head_dim = 128
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.qk_norm = qk_norm
@@ -410,8 +410,6 @@ class BooguAttention(nn.Module):
     ) -> torch.Tensor:
         q, k, v = self._qkv(hidden_states)
         q, k = self._norm_and_rope(q, k, freqs_cis)
-        # Boogu's head_dim=120 is not an FA-supported bucket; pad to 128 (the
-        # softmax_scale still uses the true 120) and slice the padding back off.
         pad = self._padded_head_dim - self.head_dim
         if pad:
             q = nn.functional.pad(q, (0, pad))
@@ -495,7 +493,7 @@ class BooguJointAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.head_dim = dim // num_heads
-        self._padded_head_dim = 128  # Boogu head_dim=120 → next FA-supported bucket
+        self._padded_head_dim = 128
         self.qk_norm = qk_norm
         self.enable_packed_qkv_input_a2a = bool(enable_packed_qkv_input_a2a)
 
@@ -603,8 +601,6 @@ class BooguJointAttention(nn.Module):
             )
         query, key = apply_rope_per_sample(query, key, freqs_cis)
 
-        # Boogu's head_dim=120 is not an FA-supported bucket; pad to 128 (the
-        # softmax_scale still uses the true 120) and slice the padding back off.
         pad = self._padded_head_dim - self.head_dim
         if pad:
             query = nn.functional.pad(query, (0, pad))
@@ -1001,15 +997,9 @@ class BooguStreamLayout(msgspec.Struct, frozen=True):
     seq_lengths: List[int]
     img_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
     joint_freqs_cis: Tuple[torch.Tensor, torch.Tensor]
-    # 0 when the image stream is not sharded, and also 0 when the instruction
-    # stream is sharded (text_sharded) -- both streams are then split evenly and
-    # nothing is replicated.
     num_replicated_prefix: int = 0
-    # Image-stream length before padding and sharding, for the gather afterwards.
     global_img_seq_len: int = 0
-    # Whether the instruction stream is also sharded across ranks.
     text_sharded: bool = False
-    # Instruction-stream length before sharding, for the gather afterwards.
     global_instruct_len: int = 0
 
 
@@ -1518,14 +1508,9 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         the bitwise-exact route.
         """
         return (
-            should_shard_text(instruct_seq_len)
-            and instruct_seq_len % self.sp_size == 0
+            should_shard_text(instruct_seq_len) and instruct_seq_len % self.sp_size == 0
         )
 
-    # Dynamo cannot reconstruct the msgspec.Struct this returns
-    # ("object.__new__(BooguStreamLayout) is not safe"), and the sharding decision
-    # it makes is data-dependent Python over sequence lengths, so it belongs outside
-    # the graph regardless. The stream layers after it still compile.
     @torch.compiler.disable
     def _layout_stream_inputs(
         self,
@@ -1583,8 +1568,6 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         context_cos, context_sin = rope.context
 
         if not text_shard_enabled:
-            # Image-only sharding: the instruction stream stays replicated on
-            # every rank and rides the joint attention as a shared prefix.
             return (
                 local_img,
                 instruct_hidden_states,
@@ -1602,9 +1585,6 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 ),
             )
 
-        # Text sharding: split the instruction stream (and its RoPE) evenly too.
-        # The length divides the SP degree, so `build_shard_plan` adds no pad and
-        # `shard_like` is a contiguous slice -- no relocation or tail masking.
         txt_shard = build_shard_plan(instruct_seq_len)
         local_instruct = shard_like(instruct_hidden_states, txt_shard, dim=1)
         local_ctx_cos = shard_like(context_cos, txt_shard, dim=1)
@@ -1642,10 +1622,6 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         rank.
         """
         if layout.text_sharded:
-            # Both streams are sharded: each rank holds `[local instruct | local
-            # image]`. All-gather each contiguously-sharded stream back to its
-            # global length (`gather_seq` trims the image's SP padding), then
-            # repack into the model's `[instruct | image | pad]` layout.
             local_instruct_len = layout.encoder_seq_lengths[0]
             instruct_local = joint_hidden_states[:, :local_instruct_len]
             img_local = joint_hidden_states[:, local_instruct_len:]
@@ -1711,9 +1687,6 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             device=device,
         )
 
-        # The refiners always run replicated: they are ~5% of the layers, and the
-        # ref-image stream is packed against the *whole* noise stream, so there is
-        # nothing to shard before the double-stream layers anyway.
         replicated_stage = self.sp_size > 1
         sequence_shard_enabled = self._sequence_shard_enabled(rope)
         text_shard_enabled = sequence_shard_enabled and self._text_shard_enabled(
@@ -1748,9 +1721,6 @@ class BooguImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
             sequence_shard_enabled=sequence_shard_enabled,
             text_shard_enabled=text_shard_enabled,
         )
-        # Sharded, the all-to-all inside the attention is what makes each rank see
-        # the whole sequence; unsharded at sp>1 every rank holds the whole thing
-        # already and must not communicate.
         stream_replicated_stage = replicated_stage and not sequence_shard_enabled
 
         img_mask_meta = build_varlen_mask_meta_from_lengths(

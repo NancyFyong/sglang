@@ -1,0 +1,7 @@
+=== runs (warmup pays the compile, so it is excluded from s/step) ===
+  eager          1.4818 s/step
+  compile        FAILED s/step
+
+=== vs stored sp1 reference ===
+  eager          psnr=     inf dB  max|diff|=   0  BITWISE-EXACT
+  compile        MISSING

@@ -28,15 +28,12 @@ from sglang.multimodal_gen.runtime.models.dits.boogu_image import (
     validate_sequence_parallel_config,
 )
 
-# Boogu-Image: 28 query heads over 7 KV heads.
 NUM_HEADS = 28
 NUM_KV_HEADS = 7
 
 
 class TestUlyssesKvHeadRepeats(unittest.TestCase):
     def test_boogu_head_counts_across_supported_degrees(self):
-        # 7 KV heads divide neither 2 nor 4, so the KV side has to be widened to
-        # 14 / 28 for the head-axis all-to-all to have anything to split.
         self.assertEqual(
             ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size=1), 1
         )
@@ -46,21 +43,15 @@ class TestUlyssesKvHeadRepeats(unittest.TestCase):
         self.assertEqual(
             ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size=4), 4
         )
-        # A degree that already divides the KV heads needs no duplication.
         self.assertEqual(
             ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size=7), 1
         )
 
     def test_degree_that_does_not_divide_query_heads_is_rejected(self):
-        # 28 query heads cannot be split 8 ways; without this the all-to-all
-        # would reshape into a head shard that drops four heads.
         with self.assertRaises(ValueError):
             ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size=8)
 
     def test_widened_kv_heads_stay_a_whole_number_of_query_groups(self):
-        # The duplication only preserves the GQA pairing if the widened KV count
-        # divides the query heads. Assert it for every degree the query heads
-        # admit, which is what lets `expand_kv_heads` be a plain repeat.
         for ulysses_size in (1, 2, 4, 7, 14, 28):
             repeats = ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size)
             self.assertEqual(NUM_HEADS % (NUM_KV_HEADS * repeats), 0)
@@ -71,9 +62,6 @@ class TestExpandKvHeads(unittest.TestCase):
         return query_head // (NUM_HEADS // num_kv_heads)
 
     def test_duplication_preserves_the_gqa_pairing(self):
-        # Every query head must still read the KV head it read before widening.
-        # If it does not, attention is silently computed against a neighbour's
-        # keys.
         for ulysses_size in (2, 4):
             repeats = ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size)
             kv = torch.arange(NUM_KV_HEADS, dtype=torch.float32).view(1, 1, -1, 1)
@@ -90,9 +78,6 @@ class TestExpandKvHeads(unittest.TestCase):
                 )
 
     def test_per_rank_head_shards_keep_queries_with_their_keys(self):
-        # `_forward_with_replicated_prefix` slices the replicated prefix by
-        # `rank * heads_per_rank`, so the q and kv shards only line up if the
-        # widened KV heads land in the same rank-major order.
         ulysses_size = 4
         repeats = ulysses_kv_head_repeats(NUM_HEADS, NUM_KV_HEADS, ulysses_size)
         widened_kv_heads = NUM_KV_HEADS * repeats
@@ -106,7 +91,6 @@ class TestExpandKvHeads(unittest.TestCase):
                     heads_per_rank // kv_heads_per_rank
                 )
                 global_kv_head = rank * kv_heads_per_rank + local_kv_head
-                # The widened head at `global_kv_head` is a copy of this one.
                 self.assertEqual(
                     global_kv_head // repeats,
                     self._kv_head_of_query(NUM_KV_HEADS, global_query_head),
@@ -115,8 +99,6 @@ class TestExpandKvHeads(unittest.TestCase):
 
 class TestSequenceSharding(unittest.TestCase):
     def test_chunks_concatenate_back_into_the_input(self):
-        # The all-to-all gathers rank shards in rank order, so shard i must be
-        # the i-th contiguous block -- not a strided view.
         tensor = torch.arange(2 * 12 * 3, dtype=torch.float32).view(2, 12, 3)
         chunks = [shard_sequence(tensor, num_chunks=4, chunk_index=i) for i in range(4)]
 
@@ -125,8 +107,6 @@ class TestSequenceSharding(unittest.TestCase):
         torch.testing.assert_close(torch.cat(chunks, dim=1), tensor)
 
     def test_freqs_chunks_track_the_token_chunks(self):
-        # RoPE travels with the token. A token moved to another rank keeps its
-        # position only if its (cos, sin) row moves with it.
         tokens = torch.arange(8, dtype=torch.float32).view(1, 8, 1)
         cos = torch.arange(8, dtype=torch.float32).view(1, 8, 1)
         sin = -cos
@@ -140,8 +120,6 @@ class TestSequenceSharding(unittest.TestCase):
             torch.testing.assert_close(chunk_sin, -token_chunk)
 
     def test_padding_freqs_are_identity_rotations(self):
-        # Shard padding is appended after the real tokens, so its rotation must
-        # be a no-op -- the same convention `_slice_freqs` uses for its padding.
         cos = torch.full((1, 3, 4), 0.5)
         sin = torch.full((1, 3, 4), 0.25)
 
@@ -159,9 +137,6 @@ class TestSequenceSharding(unittest.TestCase):
 
 class TestUniformJointLayout(unittest.TestCase):
     def test_uniform_lengths_pack_as_plain_concatenation(self):
-        # The sharded layout reuses the global packer with uniform lengths. That
-        # only works because uniform lengths make it a plain concat -- which is
-        # what makes `num_replicated_prefix` a single number for the whole batch.
         instruct = torch.arange(2 * 3 * 2, dtype=torch.float32).view(2, 3, 2)
         img = torch.arange(2 * 5 * 2, dtype=torch.float32).view(2, 5, 2) + 100
 
@@ -209,16 +184,13 @@ def _bare_transformer(sp_size: int) -> BooguImageTransformer2DModel:
 
 
 def _instruct(seq_len: int, batch_size: int = 1, dim: int = 4) -> torch.Tensor:
-    # Distinct per (row, token, channel) so a wrong shard offset is visible.
-    return torch.arange(
-        batch_size * seq_len * dim, dtype=torch.float32
-    ).view(batch_size, seq_len, dim)
+    return torch.arange(batch_size * seq_len * dim, dtype=torch.float32).view(
+        batch_size, seq_len, dim
+    )
 
 
 class TestLayoutStreamInputs(unittest.TestCase):
     def test_unsharded_layout_is_the_global_packing(self):
-        # At sp=1 the stream layers must see exactly what they saw before this
-        # feature: the per-sample packing straight off the rope bundle.
         transformer = _bare_transformer(sp_size=1)
         rope = _rope_bundle([3, 2], [5, 5])
         img = torch.zeros((2, 5, 4))
@@ -261,9 +233,6 @@ class TestLayoutStreamInputs(unittest.TestCase):
                     text_shard_enabled=False,
                 )
             shards.append(local_img)
-            # The instruction stream stays whole, so the joint sequence each rank
-            # holds is [instruct | its image shard], and everything before the
-            # image shard is what the attention must not gather twice.
             self.assertIs(local_instruct, instruct)
             self.assertFalse(layout.text_sharded)
             self.assertEqual(layout.num_replicated_prefix, 3)
@@ -276,8 +245,6 @@ class TestLayoutStreamInputs(unittest.TestCase):
         torch.testing.assert_close(torch.cat(shards, dim=1), img)
 
     def test_sharded_layout_pads_an_indivisible_image_stream(self):
-        # 9 tokens over 2 ranks: without the pad the reshape into equal shards
-        # would raise, and rounding it down would drop a token.
         transformer = _bare_transformer(sp_size=2)
         rope = _rope_bundle([3], [9])
         img = torch.ones((1, 9, 4))
@@ -298,17 +265,10 @@ class TestLayoutStreamInputs(unittest.TestCase):
 
         self.assertEqual(local_img.shape, (1, 5, 4))
         self.assertEqual(layout.global_img_seq_len, 9)
-        # The last rank's tail is the pad, and it must be zero-valued with an
-        # identity rotation rather than a copy of a real token.
         torch.testing.assert_close(local_img[0, 4], torch.zeros(4))
         torch.testing.assert_close(layout.img_freqs_cis[0][0, 4], torch.ones(2))
 
     def test_text_sharded_layout_splits_both_streams(self):
-        # With a divisible instruction length both streams split evenly, the
-        # replicated prefix drops to 0, and each rank's local joint is
-        # [instruct shard | image shard]. A wrong shard offset here returns a
-        # plausible wrong image, so pin that both streams reassemble contiguously
-        # and the local lengths add up.
         transformer = _bare_transformer(sp_size=2)
         rope = _rope_bundle([4], [8])
         img = torch.arange(8 * 4, dtype=torch.float32).view(1, 8, 4)
@@ -324,13 +284,13 @@ class TestLayoutStreamInputs(unittest.TestCase):
                         return_value=type("G", (), {"rank_in_group": rank})(),
                     )
                 )
-                # build_shard_plan reads the real (=1) world size on CPU, so pin
-                # both to this transformer's degree/rank.
                 stack.enter_context(
                     patch.object(sp_shard_utils, "get_sp_world_size", return_value=2)
                 )
                 stack.enter_context(
-                    patch.object(sp_shard_utils, "get_sp_parallel_rank", return_value=rank)
+                    patch.object(
+                        sp_shard_utils, "get_sp_parallel_rank", return_value=rank
+                    )
                 )
                 local_img, local_instruct, layout = transformer._layout_stream_inputs(
                     img_hidden_states=img,
@@ -348,20 +308,14 @@ class TestLayoutStreamInputs(unittest.TestCase):
             self.assertEqual(layout.seq_lengths, [6])
             self.assertEqual(layout.global_img_seq_len, 8)
             self.assertEqual(layout.global_instruct_len, 4)
-            # Local joint freqs cover [local instruct | local image] = 2 + 4.
             self.assertEqual(layout.joint_freqs_cis[0].shape, (1, 6, 2))
 
-        # Both streams are contiguous shards, so rank order reassembles the input
-        # -- which is exactly what the all-gather at the end relies on.
         torch.testing.assert_close(torch.cat(img_shards, dim=1), img)
         torch.testing.assert_close(torch.cat(instruct_shards, dim=1), instruct)
 
 
 class TestSequenceParallelConfigValidation(unittest.TestCase):
     def test_ring_degree_above_one_is_rejected(self):
-        # `_forward_with_replicated_prefix` ends in a local attention call with no
-        # ring pass, so ring>1 would drop the other ranks' keys instead of
-        # failing.
         with self.assertRaises(ValueError):
             validate_sequence_parallel_config(sp_size=4, ring_size=2)
 
@@ -370,14 +324,7 @@ class TestSequenceParallelConfigValidation(unittest.TestCase):
         validate_sequence_parallel_config(sp_size=1, ring_size=1)
 
     def test_packed_qkv_input_a2a_defaults_on(self):
-        # Boogu deliberately defaults this ON (every other model, and the
-        # conservative attention-constructor default, keep it OFF): the plain USP
-        # path is Boogu's default route, packing q/k/v into one all-to-all is
-        # bitwise-exact, and it measured ~1% faster. A future diff that flips the
-        # default OFF to "match the others" is a silent perf regression, so pin it.
-        self.assertTrue(
-            BooguImageDitConfig().arch_config.enable_packed_qkv_input_a2a
-        )
+        self.assertTrue(BooguImageDitConfig().arch_config.enable_packed_qkv_input_a2a)
 
 
 if __name__ == "__main__":

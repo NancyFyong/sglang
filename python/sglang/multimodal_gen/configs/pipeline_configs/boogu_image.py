@@ -166,12 +166,6 @@ class BooguImageCFGPolicy(CFGPolicy):
 class BooguImagePipelineConfig(ImagePipelineConfig):
     task_type: ModelTaskType = ModelTaskType.TI2I
 
-    # BooguImageCFGPolicy carries the edit-path multi-branch CFG (cond_ref /
-    # drop_text / drop_all). exact_parallel_combine=True routes CFG-parallel
-    # through its own combine() (accurate serial arithmetic + postprocess)
-    # instead of the re-associated two-branch all-reduce shortcut, making
-    # --cfg-parallel-size 2 bitwise-identical to a single-GPU run. Boogu has no
-    # recorded CFG-parallel baseline to preserve, so the accurate combine wins.
     cfg_policy: CFGPolicy = field(
         default_factory=lambda: BooguImageCFGPolicy(exact_parallel_combine=True)
     )
@@ -212,11 +206,6 @@ class BooguImagePipelineConfig(ImagePipelineConfig):
         return None
 
     def shard_latents_for_sp(self, batch, latents):
-        # Boogu shards inside the DiT, not here: its latents are 5D
-        # [B, C, 1, H, W] and only become a flat token sequence after the
-        # patch embedder, and the instruction stream has to stay replicated
-        # while the image stream is split. Hand the pipeline the full latents
-        # and let the transformer do the split.
         return latents, False
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):

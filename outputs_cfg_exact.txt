@@ -1,0 +1,9 @@
+=== runs ===
+  sp1_ctl      1.3826 s/step
+  cfg2_fix     0.6912 s/step
+  cfg2sp2_fix  0.4165 s/step
+
+=== bitwise comparison vs stored sp1 reference ===
+  sp1_ctl      psnr=     inf dB  max|diff|=   0  BITWISE-EXACT
+  cfg2_fix     psnr=     inf dB  max|diff|=   0  BITWISE-EXACT
+  cfg2sp2_fix  psnr=     inf dB  max|diff|=   0  BITWISE-EXACT

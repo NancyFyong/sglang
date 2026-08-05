@@ -1835,8 +1835,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if (
                 len(cfg_policy.branches) == 2
                 and get_classifier_free_guidance_world_size() == 2
-                # The two-branch shortcut all-reduces pre-scaled predictions, so
-                # it cannot use the serial (higher-precision) combine formula.
                 and not cfg_policy.exact_parallel_combine
             ):
                 return run_two_branch_cfg_parallel(

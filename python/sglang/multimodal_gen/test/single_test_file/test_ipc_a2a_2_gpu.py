@@ -35,10 +35,6 @@ def _worker() -> int:
     )
 
     rank = int(os.environ["RANK"])
-    # Place the pair on devices {2, 3} when the box has them, not {0, 1}: that is
-    # the layout --cfg-parallel-size 2 --ulysses-degree 2 produces for the second
-    # CFG group, and it is what regressed when the transport assumed the peer was
-    # `1 - dev` (negative for dev >= 2). On a 2-GPU box this stays {0, 1}.
     dev_base = 2 if torch.cuda.device_count() >= 4 else 0
     dev = dev_base + rank
     torch.cuda.set_device(dev)

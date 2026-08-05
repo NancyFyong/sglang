@@ -1,0 +1,7 @@
+=== runs (warmup pays the compile, so it is excluded from s/step) ===
+  eager          1.5383 s/step
+  compile        1.1916 s/step
+
+=== vs stored sp1 reference ===
+  eager          psnr=     inf dB  max|diff|=   0  BITWISE-EXACT
+  compile        psnr=   24.22 dB  max|diff|= 231  differs

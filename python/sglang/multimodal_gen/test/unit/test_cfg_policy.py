@@ -43,9 +43,6 @@ class TestCFGPolicyCombine(unittest.TestCase):
         policy = CFGPolicy(exact_parallel_combine=True)
         req, pipeline_config = _combine_env()
 
-        # Values close to each other, as cond/uncond predictions are: that is the
-        # regime where re-associating into cfg_scale * p + (1 - cfg_scale) * n
-        # loses precision, so equality here is a real constraint.
         pos = torch.tensor([0.5312, -1.25, 0.0078], dtype=torch.bfloat16)
         neg = torch.tensor([0.5273, -1.24, 0.0079], dtype=torch.bfloat16)
 

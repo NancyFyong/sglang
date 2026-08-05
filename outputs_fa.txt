@@ -1,0 +1,15 @@
+=== pass 1 ===
+  sdpa_p1        1.3833    s/step   transformer=torch_sdpa
+  fa_p1          1.2689    s/step   transformer=fa
+=== pass 2 ===
+  sdpa_p2        1.3833    s/step   transformer=torch_sdpa
+  fa_p2          1.2691    s/step   transformer=fa
+=== fa + torch.compile (the two levers together) ===
+  fa_compile     1.0808    s/step   transformer=fa
+
+=== vs stored single-GPU sdpa reference ===
+  sdpa_p1        psnr=   21.44 dB  max|diff|= 254  differs
+  fa_p1          psnr=   24.74 dB  max|diff|= 241  differs
+  sdpa_p2        psnr=   21.44 dB  max|diff|= 254  differs
+  fa_p2          psnr=   24.74 dB  max|diff|= 241  differs
+  fa_compile     psnr=   22.46 dB  max|diff|= 246  differs
